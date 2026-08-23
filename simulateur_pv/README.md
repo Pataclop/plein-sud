@@ -104,7 +104,7 @@ sur l'appoint électrique, nombre de cycles batterie et durée de vie estimée.
 
 ---
 
-## Les sept onglets
+## Les neuf onglets
 
 1. **Site et météo** — coordonnées, années, base PVGIS, téléchargement,
    paramètres modules. Graphique du rayonnement et de la température mensuels.
@@ -124,7 +124,23 @@ sur l'appoint électrique, nombre de cycles batterie et durée de vie estimée.
 7. **Optimisation** — balayage d'un paramètre (inclinaison, puissance crête,
    batterie, onduleurs) avec repérage automatique de l'optimum, et calcul du
    **budget de consommation** : pour chaque mois, la consommation journalière
-   maximale compatible avec l'objectif d'autonomie.
+   maximale compatible avec l'objectif d'autonomie. Deux vues : les profils
+   mois par mois de chaque option, et des histogrammes qui comparent les
+   options entre elles (cumul sur l'année, moyenne des douze mois, mois le
+   plus défavorable, économie et temps de retour).
+8. **Orientations** — recherche de l'inclinaison et de l'azimut de chaque
+   groupe pour un critère au choix, avec la carte du critère par groupe.
+9. **Leviers** — par quoi commencer pour payer moins de réseau : l'énergie
+   achetée est imputée à chaque poste de consommation (avec la part consommée
+   la nuit, celle qui coûte le plus cher), puis chaque action envisageable
+   — panneaux, batterie, onduleur, poste allégé de 10 %, usage décalé au
+   soleil, appareil de fond remplacé — est réellement simulée et classée par
+   gain annuel, coût et temps de retour.
+
+Tous les graphiques réagissent au survol (réticule et valeurs de toutes les
+courbes) et s'ouvrent en plein écran d'un clic, avec la légende complète, les
+valeurs sous le curseur et le minimum, la moyenne, le maximum et le total de
+chaque courbe.
 
 `F5` relance la simulation. Le bouton *Exporter CSV* sort le bilan mensuel,
 tous les indicateurs et l'intégralité du détail journalier.

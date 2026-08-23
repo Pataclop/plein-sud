@@ -58,15 +58,15 @@
     {
       "nom": "champ 1",
       "actif": true,
-      "n_panneaux": 44,
+      "n_panneaux": 48,
       "wc_panneau": 500,
       "inclinaison": 35.0,
       "azimut": 180.0,
       "surface_m2_panneau": 2.2,
       "ombrage_pct": 0.0,
-      "voc_v": 49.5,
+      "voc_v": 47.0,
       "isc_a": 13.9,
-      "n_serie": 11
+      "n_serie": 12
     }
   ],
   "postes": [
@@ -75,7 +75,7 @@
       "kind": "talon",
       "actif": true,
       "params": {
-        "puissance_w": 500.0,
+        "puissance_w": 400.0,
         "variation_hiver": 0.15
       }
     },
@@ -84,7 +84,7 @@
       "kind": "chauffage",
       "actif": true,
       "params": {
-        "besoin_th_kwh_an": 28240.0,
+        "besoin_th_kwh_an": 20000.0,
         "t_base": 15.0,
         "t_consigne": 20.0,
         "cop_a": 2.75,
@@ -93,7 +93,7 @@
         "p_pac_kw_th": 26.0,
         "declassement_froid": 0.28,
         "part_bois": 0.25,
-        "t_bois": 4.0,
+        "t_bois": 5.0,
         "inertie_h": 12.0
       }
     },

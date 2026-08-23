@@ -3,6 +3,7 @@ Moteur de simulation : production des champs, gestion onduleur / batterie
 au pas horaire, agregations jour et mois, bilan economique.
 """
 from __future__ import annotations
+import re
 import numpy as np
 
 from .solar import field_dc_power
@@ -398,18 +399,23 @@ def economics(cfg: dict, res: dict) -> dict:
     econ_vs_sans = cout_sans - cout_avec
     econ_vs_actuel = facture_actuelle - cout_avec
 
-    # Retour actualise avec inflation energie
+    # Retour actualise avec inflation energie, interpole a l'interieur de
+    # l'annee de bascule (pas seulement l'annee entiere qui suit)
     infl = float(e.get("inflation_energie", 0.0))
     horizon = int(e.get("duree_analyse_ans", 25))
-    cum, retour_vs_sans, retour_vs_actuel = -capex, None, None
-    cum2 = -capex
+    cum, cum2 = -capex, -capex
+    retour_vs_sans = 0.0 if cum >= 0 else None
+    retour_vs_actuel = 0.0 if cum2 >= 0 else None
     for an in range(1, horizon + 1):
-        cum += econ_vs_sans * (1 + infl) ** (an - 1)
-        cum2 += econ_vs_actuel * (1 + infl) ** (an - 1)
+        gain1 = econ_vs_sans * (1 + infl) ** (an - 1)
+        gain2 = econ_vs_actuel * (1 + infl) ** (an - 1)
+        avant, avant2 = cum, cum2
+        cum += gain1
+        cum2 += gain2
         if retour_vs_sans is None and cum >= 0:
-            retour_vs_sans = an
+            retour_vs_sans = (an - 1) + (-avant / gain1 if gain1 > 1e-9 else 0.0)
         if retour_vs_actuel is None and cum2 >= 0:
-            retour_vs_actuel = an
+            retour_vs_actuel = (an - 1) + (-avant2 / gain2 if gain2 > 1e-9 else 0.0)
 
     prod = max(k["production_an"], 1e-9)
     utilise = k["besoin_an"] - k["import_an"]
@@ -801,6 +807,203 @@ def appliquer_orientations(cfg, resultat):
 # --------------------------------------------------------------------------
 # Budget energetique : combien puis-je consommer ?
 # --------------------------------------------------------------------------
+# Leviers : d'ou vient l'import reseau, et que rapporte chaque action
+# --------------------------------------------------------------------------
+def attribution_import(res: dict, meteo: dict, prix_kwh: float = 0.0) -> list[dict]:
+    """Impute a chaque poste sa part de l'energie achetee au reseau.
+
+    A chaque heure, l'import est reparti entre les postes au prorata de leur
+    part dans le besoin de cette heure-la. Un poste qui tourne la nuit porte
+    donc la quasi-totalite de l'import nocturne, alors qu'un poste cale sur
+    le soleil n'en porte presque rien : c'est exactement ce que l'on cherche
+    a voir pour savoir quel appareil coute cher au reseau.
+    """
+    d = res["dispatch"]
+    besoin = d["besoin_total"]
+    part = np.where(besoin > 1e-9, d["import"] / np.maximum(besoin, 1e-9), 0.0)
+    nuit = res["pv_dc"] <= 0.05
+    ny = meteo["n_years"]
+    lignes = []
+    postes = list(res["detail_postes"].items())
+    postes.append(("Veille des onduleurs", d["veille"]))
+    for nom, arr in postes:
+        conso = float(arr.sum() / ny)
+        imp = float((arr * part).sum() / ny)
+        lignes.append({
+            "nom": nom,
+            "conso": conso,
+            "import": imp,
+            "autoconso": conso - imp,
+            "part_importee": imp / max(conso, 1e-9),
+            "part_nuit": float(arr[nuit].sum() / max(arr.sum(), 1e-9)),
+            "cout_import": imp * prix_kwh,
+        })
+    lignes.sort(key=lambda l: -l["import"])
+    return lignes
+
+
+# Parametre a diminuer pour tester "ce poste consomme 10 % de moins",
+# par type de poste.
+LEVIER_REDUCTION = {
+    "talon": ("puissance_w", "la puissance permanente"),
+    "generique": ("kwh_an", "la consommation annuelle"),
+    "chauffage": ("besoin_th_kwh_an", "le besoin thermique"),
+    "ecs": ("besoin_th_kwh_an", "le besoin d'eau chaude"),
+    "spa": ("ua_w_par_k", "les pertes du spa"),
+    "piscine": ("heures_par_mois", "les heures de filtration"),
+    "vehicule": ("km_an", "le kilometrage annuel"),
+}
+
+# Profils deja cales sur le soleil : rien a decaler.
+PROFILS_SOLAIRES = ("solaire", "solaire_large", "jour")
+
+
+def _mettre_a_l_echelle(params: dict, cle: str, facteur: float) -> bool:
+    """Multiplie un parametre (scalaire ou liste de 12 mois) par un facteur."""
+    if cle not in params:
+        return False
+    v = params[cle]
+    if isinstance(v, (list, tuple)):
+        params[cle] = [float(x) * facteur for x in v]
+    else:
+        params[cle] = float(v) * facteur
+    return True
+
+
+def _champ_principal(cfg: dict) -> int:
+    """Index du champ actif qui porte le plus de panneaux."""
+    actifs = [(i, c) for i, c in enumerate(cfg["champs"]) if c.get("actif", True)]
+    if not actifs:
+        return -1
+    return max(actifs, key=lambda ic: int(ic[1].get("n_panneaux", 0)))[0]
+
+
+def _variantes_leviers(cfg, reduction, talon_w, cout_remplacement):
+    """Liste des actions a simuler : (nom, categorie, explication, mutation,
+    cout impose)."""
+    v = []
+    idx = _champ_principal(cfg)
+    if idx >= 0:
+        nom_champ = cfg["champs"][idx]["nom"]
+        for n in (1, 4):
+            def ajoute(c, n=n, idx=idx):
+                c["champs"][idx]["n_panneaux"] = int(
+                    c["champs"][idx].get("n_panneaux", 0)) + n
+            v.append((f"+{n} panneau{'x' if n > 1 else ''}", "Production",
+                      f"{n} module{'s' if n > 1 else ''} de plus sur \"{nom_champ}\", "
+                      f"cablage compris. Le cout vient de la nomenclature.",
+                      ajoute, None))
+
+    pack = 16.07
+    for n in (1, 2):
+        def batterie(c, n=n, pack=pack):
+            c["systeme"]["batt_kwh_nominal"] = float(
+                c["systeme"]["batt_kwh_nominal"]) + n * pack
+        v.append((f"+{n} pack batterie ({n * pack:.0f} kWh)", "Stockage",
+                  f"{n} pack{'s' if n > 1 else ''} LFP de plus : cellules, BMS et "
+                  f"coffret. Deplace de l'energie du jour vers la nuit, sans "
+                  f"produire un kWh de plus.",
+                  batterie, None))
+
+    def onduleur(c):
+        c["systeme"]["n_onduleurs"] = int(c["systeme"]["n_onduleurs"]) + 1
+    v.append(("+1 onduleur", "Production",
+              "Un onduleur hybride de plus : plus de puissance AC et de "
+              "puissance de charge, donc moins d'ecretage aux heures de pointe.",
+              onduleur, None))
+
+    for i, p in enumerate(cfg["postes"]):
+        if not p.get("actif", True):
+            continue
+        kind = p.get("kind", "generique")
+        nom = p["nom"]
+        cle_lib = LEVIER_REDUCTION.get(kind)
+        if cle_lib:
+            cle, libelle = cle_lib
+
+            def reduire(c, i=i, cle=cle, f=1.0 - reduction):
+                _mettre_a_l_echelle(c["postes"][i]["params"], cle, f)
+            v.append((f"{nom} : -{100 * reduction:.0f} %", "Consommation",
+                      f"Reduction de {100 * reduction:.0f} % sur {libelle} de "
+                      f"\"{nom}\" (appareil plus sobre, meilleure isolation, "
+                      f"usage plus court). Le cout depend de l'action retenue.",
+                      reduire, 0.0))
+        profil = p.get("params", {}).get("profil")
+        if profil and profil not in PROFILS_SOLAIRES:
+            def decaler(c, i=i):
+                c["postes"][i]["params"]["profil"] = "solaire_large"
+            v.append((f"{nom} : decaler au soleil", "Pilotage",
+                      f"Meme energie, mais consommee entre 9 h et 17 h "
+                      f"(programmation, minuterie) au lieu du profil "
+                      f"\"{profil}\". Ne coute rien d'autre qu'un reglage.",
+                      decaler, 0.0))
+
+    talon = next((i for i, p in enumerate(cfg["postes"])
+                  if p.get("kind") == "talon" and p.get("actif", True)), None)
+    if talon is not None and talon_w > 0:
+        nom = cfg["postes"][talon]["nom"]
+
+        def froid(c, talon=talon, talon_w=talon_w):
+            p = c["postes"][talon]["params"]
+            p["puissance_w"] = max(float(p.get("puissance_w", 0.0)) - talon_w, 0.0)
+        v.append((f"{nom} : -{talon_w:.0f} W en continu", "Consommation",
+                  f"Remplacement des appareils de fond les plus gourmands "
+                  f"(refrigerateur, congelateur, vieux circulateur) : "
+                  f"{talon_w:.0f} W de moins 24 h/24, soit "
+                  f"{talon_w * 8.766:.0f} kWh/an. Cout suppose du remplacement "
+                  f"pris dans le champ prevu a cet effet.",
+                  froid, float(cout_remplacement)))
+    return v
+
+
+def leviers(cfg: dict, meteo: dict, reduction=0.10, talon_w=50.0,
+            cout_remplacement=900.0, progress=None) -> dict:
+    """Classe les actions possibles par gain annuel sur la facture.
+
+    Chaque action est reellement simulee sur toute la serie meteo, puis
+    comparee a la configuration actuelle : energie achetee en moins, euros
+    economises par an, cout de l'action et temps de retour.
+    """
+    from copy import deepcopy
+    base = simulate(cfg, meteo)
+    prix = float(cfg["economie"]["prix_kwh_achat"])
+    ref = {
+        "cout_an": base["eco"]["cout_annuel_avec_pv"],
+        "capex": base["eco"]["capex"],
+        "import_an": base["kpi"]["import_an"],
+        "besoin_an": base["kpi"]["besoin_an"],
+        "autonomie": base["kpi"]["autonomie"],
+        "ecrete_an": base["kpi"]["ecrete_an"],
+    }
+    variantes = _variantes_leviers(cfg, reduction, talon_w, cout_remplacement)
+    actions = []
+    for i, (nom, cat, detail, mutation, cout_impose) in enumerate(variantes):
+        c = deepcopy(cfg)
+        mutation(c)
+        r = simulate(c, meteo)
+        cout = (r["eco"]["capex"] - ref["capex"]) if cout_impose is None \
+            else float(cout_impose)
+        gain = ref["cout_an"] - r["eco"]["cout_annuel_avec_pv"]
+        retour = cout / gain if (cout > 0 and gain > 0) else None
+        actions.append({
+            "nom": nom, "categorie": cat, "detail": detail,
+            "gain_an": gain,
+            "import_evite": ref["import_an"] - r["kpi"]["import_an"],
+            "besoin_evite": ref["besoin_an"] - r["kpi"]["besoin_an"],
+            "autonomie": r["kpi"]["autonomie"],
+            "gain_autonomie": r["kpi"]["autonomie"] - ref["autonomie"],
+            "cout": cout,
+            "retour": retour,
+            "gain_par_1000": 1000.0 * gain / cout if cout > 0 else None,
+        })
+        if progress:
+            progress(int(100 * (i + 1) / len(variantes)), nom)
+    actions.sort(key=lambda a: -a["gain_an"])
+    return {"reference": ref, "prix_kwh": prix, "actions": actions,
+            "attribution": attribution_import(base, meteo, prix)}
+
+
+# --------------------------------------------------------------------------
 def budget_consommation(cfg: dict, meteo: dict, res: dict, cible=0.92):
     """Pour chaque mois, consommation journaliere maximale compatible avec
     l'objectif d'autonomie, a installation constante."""
@@ -836,12 +1039,64 @@ def _autonomie_mois_scaled(cfg, meteo, res, mois_idx, facteur):
     return 1.0 - imp / max(besoin, 1e-9)
 
 
-# --------------------------------------------------------------------------
-# Balayages parametriques
-# --------------------------------------------------------------------------
+def parse_sweep_values(raw) -> list[float]:
+    """Parse une liste de nombres ou un intervalle du type 10:100@5."""
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, np.ndarray)):
+        return [float(v) for v in raw]
+    text = str(raw).replace(";", ",").strip()
+    if not text:
+        return []
+    chunks = [p.strip() for p in text.split(",") if p.strip()]
+    vals = []
+    for chunk in chunks:
+        if ":" not in chunk:
+            vals.append(float(chunk))
+            continue
+        m = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*:\s*(-?\d+(?:\.\d+)?)\s*(?:@\s*(\d+(?:\.\d+)?)\s*)?", chunk)
+        if not m:
+            raise ValueError(f"Format de plage non valide : {chunk!r}. Exemple : 10:100@5")
+        start, end, step = m.groups()
+        start = float(start); end = float(end)
+        step_val = float(step) if step is not None else 1.0
+        if step_val <= 0:
+            raise ValueError(f"Le pas doit etre strictement positif : {chunk!r}")
+        if start <= end:
+            cur = start
+            while cur <= end + 1e-9:
+                vals.append(float(cur))
+                cur += step_val
+        else:
+            cur = start
+            while cur >= end - 1e-9:
+                vals.append(float(cur))
+                cur -= step_val
+    return vals
+
+
+def compute_marginal_rentability(out: list[dict], key="economie_vs_actuel") -> list[float]:
+    """Retourne le taux de rentabilite marginale par unite supplementaire."""
+    scores = [0.0]
+    for i in range(1, len(out)):
+        prev = out[i - 1]
+        cur = out[i]
+        delta_capex = max(float(cur.get("capex", 0.0)) - float(prev.get("capex", 0.0)), 0.0)
+        delta_gain = float(cur.get(key, 0.0)) - float(prev.get(key, 0.0))
+        if delta_capex <= 0:
+            scores.append(0.0)
+        else:
+            scores.append(max(delta_gain / delta_capex, 0.0))
+    return scores
+
+
 def sweep(cfg: dict, meteo: dict, variable: str, valeurs, progress=None):
     """Balaye un parametre et retourne autonomie / production / capex / import."""
     from copy import deepcopy
+    if isinstance(valeurs, str):
+        valeurs = parse_sweep_values(valeurs)
+    if not valeurs:
+        return []
     out = []
     for i, v in enumerate(valeurs):
         c = deepcopy(cfg)
@@ -867,7 +1122,17 @@ def sweep(cfg: dict, meteo: dict, variable: str, valeurs, progress=None):
                     "import": r["kpi"]["import_an"],
                     "ecrete": r["kpi"]["ecrete_an"],
                     "capex": r["eco"]["capex"],
-                    "retour": r["eco"]["retour_ans_vs_actuel"]})
+                    "retour": r["eco"]["retour_ans_vs_actuel"],
+                    "economie_vs_actuel": r["eco"]["economie_vs_actuel"],
+                    "production_mensuel": r["mensuel"]["production_dc"].tolist(),
+                    "autonomie_mensuel": r["mensuel"]["autonomie"].tolist(),
+                    "import_mensuel": r["mensuel"]["import"].tolist()})
         if progress:
             progress(int(100 * (i + 1) / len(valeurs)), f"{variable} = {v}")
+    for i, item in enumerate(out):
+        item["rentabilite_marginale"] = 0.0 if i == 0 else 0.0
+    if out:
+        scores = compute_marginal_rentability(out)
+        for i, score in enumerate(scores):
+            out[i]["rentabilite_marginale"] = score
     return out

@@ -1,9 +1,9 @@
 """Interface graphique PyQt6 du simulateur."""
 from __future__ import annotations
-import os, sys, copy, csv, traceback
+import os, re, sys, copy, csv, traceback
 import numpy as np
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QTimer
 from PyQt6.QtGui import QAction, QKeySequence, QColor, QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
@@ -11,9 +11,11 @@ from PyQt6.QtWidgets import (
     QCheckBox, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
     QGroupBox, QSplitter, QListWidget, QListWidgetItem, QMessageBox,
     QFileDialog, QProgressBar, QScrollArea, QTextEdit, QSizePolicy, QGridLayout,
-    QToolTip)
+    QToolTip, QDialog, QDialogButtonBox)
 
 import matplotlib
+import matplotlib.colors
+import matplotlib.patches
 matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
@@ -32,6 +34,9 @@ CH_COLS = C.CHAMPS_COLONNES
 CH_IDX = {k: i for i, (k, _lab, _tip) in enumerate(CH_COLS) if k}
 CH_INT = {"n_panneaux", "n_serie"}
 CH_TEXTE = {"nom"}
+
+HINT = ("<br><i>Cliquez sur le graphique pour l'ouvrir en plein ecran "
+        "(legende, valeurs et statistiques de toutes les courbes).</i>")
 
 
 # ==========================================================================
@@ -176,36 +181,74 @@ class SchemaForm(QWidget):
 
 
 class MplCanvas(FigureCanvasQTAgg):
-    """Canevas matplotlib qui affiche les valeurs sous le curseur.
+    """Canevas matplotlib interactif.
 
-    Chaque trace declare ses series via hover() ; au survol on cherche le
-    point d'abscisse le plus proche et on l'affiche dans une infobulle.
+    - survol : reticule + infobulle listant toutes les series de l'axe ;
+    - clic n'importe ou dans le graphique : ouverture en plein ecran avec
+      legende, valeurs sous le curseur et statistiques de chaque courbe.
     """
 
-    def __init__(self, w=7, h=4):
+    def __init__(self, w=7, h=4, plein_ecran=True):
         self.fig = Figure(figsize=(w, h), tight_layout=True)
         super().__init__(self.fig)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._hover = {}
         self._hover2d = {}
+        self._click_handler = None
+        self._plot_fn = None
+        self._titre = ""
+        self._hover_listener = None
+        self._plein_ecran = plein_ecran
+        self._bg = None
+        self._curseurs = {}
+        self._hint = None
+        self._timer_clic = QTimer(self)
+        self._timer_clic.setSingleShot(True)
+        self._timer_clic.timeout.connect(self.ouvrir_plein_ecran)
         self.setMouseTracking(True)
         self.mpl_connect("motion_notify_event", self._on_move)
-        self.mpl_connect("figure_leave_event", lambda _e: QToolTip.hideText())
+        self.mpl_connect("button_press_event", self._on_click)
+        self.mpl_connect("draw_event", self._on_draw)
+        self.mpl_connect("figure_leave_event", self._on_leave)
+
+    # ------------------------------------------------------------------
+    # declaration du contenu
+    # ------------------------------------------------------------------
+    def set_click_handler(self, fn):
+        """Action du double-clic (le simple clic ouvre le plein ecran)."""
+        self._click_handler = fn
+
+    def set_plot(self, fn, titre=""):
+        """Fonction de trace fn(canevas), rejouee dans la fenetre plein ecran."""
+        self._plot_fn = fn
+        self._titre = titre or self._titre
+        if fn is not None and self._plein_ecran:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_hover_listener(self, fn):
+        """Callback recevant le HTML des valeurs sous le curseur ('' si dehors)."""
+        self._hover_listener = fn
 
     def clear(self):
         self.fig.clear()
         self._hover = {}
         self._hover2d = {}
+        self._curseurs = {}
+        self._hint = None
+        self._bg = None
 
-    def hover(self, axes, x, series, xfmt=None, titre=""):
+    def hover(self, axes, x, series, xfmt=None, titre="", cumul=True, sur="x"):
         """Declare les valeurs lisibles au survol.
 
         axes   : un axe matplotlib ou une liste d'axes superposes (twinx)
         x      : abscisses des points, dans les unites de l'axe
-        series : liste de (libelle, valeurs, unite, decimales)
+        series : liste de (libelle, valeurs, unite, decimales[, couleur])
         xfmt   : fonction indice -> texte, pour l'en-tete de l'infobulle
+        cumul  : True si la somme des valeurs a un sens (axe temporel)
+        sur    : "x" pour un graphique vertical, "y" pour des barres
+                 horizontales (les abscisses sont alors lues sur l'axe Y)
         """
-        payload = (np.asarray(x, dtype=float), series, xfmt, titre)
+        payload = (np.asarray(x, dtype=float), series, xfmt, titre, cumul, sur)
         for ax in (axes if isinstance(axes, (list, tuple)) else [axes]):
             self._hover[ax] = payload
 
@@ -214,57 +257,418 @@ class MplCanvas(FigureCanvasQTAgg):
         self._hover2d[ax] = (np.asarray(x, dtype=float), np.asarray(y, dtype=float),
                              np.asarray(z, dtype=float), libelles, titre)
 
+    # ------------------------------------------------------------------
+    # mise en forme
+    # ------------------------------------------------------------------
+    def draw(self):
+        if self._plot_fn is not None and self._plein_ecran and self._hint is None:
+            self._hint = self.fig.text(
+                0.995, 0.005, "clic : plein ecran", ha="right", va="bottom",
+                fontsize=6.5, color="#94a3b8", style="italic")
+        super().draw()
+
+    def completer_legendes(self, taille=8):
+        """Ajoute une legende a chaque axe qui n'en a pas mais qui en merite une.
+
+        Au-dela de quatre sous-graphes, une legende unique est posee sur la
+        figure : elle ne recouvre plus les courbes.
+        """
+        axes = [ax for ax in self.fig.axes if ax.get_legend_handles_labels()[0]]
+        if len(self.fig.axes) > 4:
+            # une legende de figure, uniquement pour les series qui ne sont
+            # pas deja nommees dans la legende d'un axe
+            vus, hh, ll = set(), [], []
+            for a in axes:
+                if a.get_legend() is not None:
+                    vus.update(t.get_text() for t in a.get_legend().get_texts())
+            for ax in [a for a in axes if a.get_legend() is None]:
+                for h, l in zip(*ax.get_legend_handles_labels()):
+                    if str(l).startswith("_") or l in vus:
+                        continue
+                    vus.add(l); hh.append(h); ll.append(l)
+            if hh:
+                self.fig.legend(hh, ll, loc="outside lower center", frameon=False,
+                                fontsize=taille, ncol=min(len(hh), 5))
+            return
+        for ax in axes:
+            if ax.get_legend() is not None:
+                ax.get_legend().set_visible(True)
+                continue
+            h, l = ax.get_legend_handles_labels()
+            if h and any(not str(x).startswith("_") for x in l):
+                ax.legend(fontsize=taille, frameon=False,
+                          ncol=2 if len(h) > 6 else 1)
+
+    # ------------------------------------------------------------------
+    # statistiques de toutes les courbes
+    # ------------------------------------------------------------------
+    def statistiques(self):
+        """Min / moyenne / max / total de chaque serie declaree, sans doublon."""
+        out, vus = [], set()
+        for _ax, (x, series, xfmt, titre, cumul, _sur) in self._hover.items():
+            for s in series:
+                lab, vals, unite, dec = s[0], s[1], s[2], s[3]
+                coul = s[4] if len(s) > 4 else None
+                nom = re.sub("<[^>]+>", "", str(lab))
+                v = np.asarray(vals, dtype=float).ravel()
+                # une meme serie declaree sur deux axes (twinx, sous-graphe
+                # voisin) ne doit apparaitre qu'une fois
+                cle = (nom, unite, v.tobytes())
+                if cle in vus:
+                    continue
+                vus.add(cle)
+                ok = np.isfinite(v)
+                if not ok.any():
+                    continue
+                idx = np.where(ok)[0]
+                imin = int(idx[np.argmin(v[idx])])
+                imax = int(idx[np.argmax(v[idx])])
+
+                def etiq(i):
+                    if callable(xfmt):
+                        try:
+                            return str(xfmt(i))
+                        except Exception:
+                            return ""
+                    return f"{x[i]:g}" if i < len(x) else ""
+
+                out.append(dict(groupe=titre, nom=nom, unite=unite, dec=dec,
+                                couleur=coul, mini=float(v[imin]), mini_x=etiq(imin),
+                                maxi=float(v[imax]), maxi_x=etiq(imax),
+                                moy=float(v[ok].mean()),
+                                total=float(v[ok].sum()) if cumul else float("nan"),
+                                n=int(ok.sum())))
+        for _ax, (x, y, z, (nx, ny, nz, unite, dec), titre) in self._hover2d.items():
+            zz = np.asarray(z, dtype=float)
+            ok = np.isfinite(zz)
+            if not ok.any():
+                continue
+            iy, ix = np.unravel_index(np.nanargmax(np.where(ok, zz, -np.inf)), zz.shape)
+            jy, jx = np.unravel_index(np.nanargmin(np.where(ok, zz, np.inf)), zz.shape)
+            pos = lambda a, b: f"{x[b]:g}° / {y[a]:g}°"
+            out.append(dict(groupe=titre, nom=nz, unite=unite, dec=dec, couleur=None,
+                            mini=float(zz[jy, jx]), mini_x=pos(jy, jx),
+                            maxi=float(zz[iy, ix]), maxi_x=pos(iy, ix),
+                            moy=float(zz[ok].mean()), total=float("nan"),
+                            n=int(ok.sum())))
+        return out
+
+    # ------------------------------------------------------------------
+    # survol
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _nb(v, dec):
+        v = float(v)
+        if abs(v) < 0.5 * 10 ** (-dec):   # evite les "-0"
+            v = 0.0
+        return f"{v:,.{dec}f}".replace(",", " ")
+
+    @staticmethod
+    def _pastille(coul):
+        if not coul:
+            return "<td></td>"
+        return (f"<td><span style='background:{coul}'>&nbsp;&nbsp;</span>"
+                f"&nbsp;</td>")
+
+    def _html_survol(self, ax, xdata, ydata):
+        """HTML des valeurs de l'axe ax sous l'abscisse xdata (None si rien)."""
+        carte = self._hover2d.get(ax)
+        if carte is not None and xdata is not None and ydata is not None:
+            x, y, z, (nx, ny, nz, unite, dec), titre = carte
+            if len(x) == 0 or len(y) == 0:
+                return None
+            ia = int(np.argmin(np.abs(x - float(xdata))))
+            it = int(np.argmin(np.abs(y - float(ydata))))
+            v = z[it, ia]
+            if not np.isfinite(v):
+                return None
+            return ("<div style='white-space:nowrap'><b>{t}</b>"
+                    "<table cellspacing='0' cellpadding='1'>"
+                    "<tr><td>{nx}&nbsp;&nbsp;</td><td align='right'><b>{vx:g}</b></td></tr>"
+                    "<tr><td>{ny}&nbsp;&nbsp;</td><td align='right'><b>{vy:g}</b></td></tr>"
+                    "<tr><td>{nz}&nbsp;&nbsp;</td><td align='right'><b>{vz}</b>"
+                    "&nbsp;{u}</td></tr></table></div>").format(
+                t=titre, nx=nx, ny=ny, nz=nz, vx=x[ia], vy=y[it],
+                vz=self._nb(v, dec), u=unite)
+        payload = self._hover.get(ax)
+        if payload is None:
+            return None
+        x, series, xfmt, titre, _cumul, sur = payload
+        pos = xdata if sur == "x" else ydata
+        if pos is None or len(x) == 0:
+            return None
+        i = int(np.argmin(np.abs(x - float(pos))))
+        entete = xfmt(i) if callable(xfmt) else f"{x[i]:g}"
+        rangs = []
+        for s in series:
+            lab, vals, unite, dec = s[0], s[1], s[2], s[3]
+            coul = s[4] if len(s) > 4 else None
+            if i >= len(vals):
+                continue
+            v = np.asarray(vals, dtype=float).ravel()[i]
+            txt = "-" if not np.isfinite(v) else self._nb(v, dec)
+            rangs.append(f"<tr>{self._pastille(coul)}<td>{lab}&nbsp;&nbsp;</td>"
+                         f"<td align='right'><b>{txt}</b>&nbsp;{unite}</td></tr>")
+        if not rangs:
+            return None
+        pied = ""
+        if self._plein_ecran and self._plot_fn is not None:
+            pied = ("<div style='color:#94a3b8'><i>clic : plein ecran</i></div>")
+        return (f"<div style='white-space:nowrap'>"
+                f"<b>{(titre + ' &mdash; ') if titre else ''}{entete}</b>"
+                f"<table cellspacing='0' cellpadding='1'>{''.join(rangs)}</table>"
+                f"{pied}</div>")
+
     def _afficher(self, ev, html):
         r = self.devicePixelRatioF() or 1.0
-        pos = QPoint(int(ev.x / r) + 12, int(self.height() - ev.y / r) + 12)
+        pos = QPoint(int(ev.x / r) + 14, int(self.height() - ev.y / r) + 14)
         QToolTip.showText(self.mapToGlobal(pos), html, self)
 
     def _on_move(self, ev):
         ax = ev.inaxes
-        carte = self._hover2d.get(ax)
-        if carte is not None and ev.xdata is not None and ev.ydata is not None:
-            x, y, z, (nx, ny, nz, unite, dec), titre = carte
-            if len(x) == 0 or len(y) == 0:
-                return
-            ia = int(np.argmin(np.abs(x - float(ev.xdata))))
-            it = int(np.argmin(np.abs(y - float(ev.ydata))))
-            v = z[it, ia]
-            if not np.isfinite(v):
-                QToolTip.hideText()
-                return
-            self._afficher(ev, (
-                f"<div style='white-space:nowrap'><b>{titre}</b>"
-                f"<table cellspacing='0' cellpadding='1'>"
-                f"<tr><td>{nx}&nbsp;&nbsp;</td><td align='right'><b>{x[ia]:g}</b></td></tr>"
-                f"<tr><td>{ny}&nbsp;&nbsp;</td><td align='right'><b>{y[it]:g}</b></td></tr>"
-                f"<tr><td>{nz}&nbsp;&nbsp;</td><td align='right'>"
-                f"<b>{v:,.{dec}f}</b>&nbsp;{unite}</td></tr>"
-                f"</table></div>").replace(",", " "))
-            return
-        payload = self._hover.get(ax)
-        if payload is None or ev.xdata is None:
+        html = self._html_survol(ax, ev.xdata, ev.ydata) if ax is not None else None
+        if html is None:
             QToolTip.hideText()
+            self._cacher_reticule()
+            if self._hover_listener:
+                self._hover_listener("")
             return
-        x, series, xfmt, titre = payload
-        if len(x) == 0:
+        self._afficher(ev, html)
+        self._reticule(ax, float(ev.xdata), float(ev.ydata))
+        if self._hover_listener:
+            self._hover_listener(html)
+
+    def _on_leave(self, _ev):
+        QToolTip.hideText()
+        self._cacher_reticule()
+        if self._hover_listener:
+            self._hover_listener("")
+
+    # ------------------------------------------------------------------
+    # reticule (blit, pour rester fluide)
+    # ------------------------------------------------------------------
+    def _on_draw(self, _ev):
+        self._bg = None
+
+    def _lignes(self, ax):
+        art = self._curseurs.get(ax)
+        if art is None:
+            xl, yl = ax.get_xlim(), ax.get_ylim()
+            v = ax.axvline(xl[0], color="#475569", lw=.8, ls="--", alpha=.85,
+                           animated=True, zorder=50)
+            h = ax.axhline(yl[0], color="#475569", lw=.8, ls="--", alpha=.55,
+                           animated=True, zorder=50)
+            ax.set_xlim(xl); ax.set_ylim(yl)
+            art = (v, h)
+            self._curseurs[ax] = art
+        return art
+
+    def _reticule(self, ax, x, y):
+        try:
+            if self._bg is None:
+                self._bg = self.copy_from_bbox(self.fig.bbox)
+            self.restore_region(self._bg)
+            v, h = self._lignes(ax)
+            v.set_xdata([x, x]); h.set_ydata([y, y])
+            ax.draw_artist(v); ax.draw_artist(h)
+            self.blit(self.fig.bbox)
+        except Exception:
+            pass
+
+    def _cacher_reticule(self):
+        if self._bg is None:
             return
-        i = int(np.argmin(np.abs(x - float(ev.xdata))))
-        entete = xfmt(i) if callable(xfmt) else f"{x[i]:g}"
-        rangs = []
-        for lab, vals, unite, dec in series:
-            if i >= len(vals):
-                continue
-            v = f"{float(vals[i]):,.{dec}f}".replace(",", " ")
-            rangs.append(f"<tr><td>{lab}&nbsp;&nbsp;</td>"
-                         f"<td align='right'><b>{v}</b>&nbsp;{unite}</td></tr>")
-        if not rangs:
+        try:
+            self.restore_region(self._bg)
+            self.blit(self.fig.bbox)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # clic
+    # ------------------------------------------------------------------
+    def _on_click(self, ev):
+        if ev.button != 1:            # seul le clic gauche ouvre le plein ecran
             return
-        # ev.x/ev.y sont en pixels physiques depuis le bas ; Qt attend des
-        # pixels logiques depuis le haut (gere dans _afficher).
-        self._afficher(ev, f"<div style='white-space:nowrap'>"
-                           f"<b>{(titre + ' &mdash; ') if titre else ''}{entete}</b>"
-                           f"<table cellspacing='0' cellpadding='1'>"
-                           f"{''.join(rangs)}</table></div>")
+        # ne pas interferer avec les outils zoom / deplacement de la barre
+        tb = getattr(self, "toolbar", None)
+        if tb is not None and str(getattr(tb, "mode", "")):
+            return
+        if ev.dblclick:
+            self._timer_clic.stop()
+            if self._click_handler is not None and ev.inaxes is not None \
+                    and ev.xdata is not None:
+                self._click_handler(float(ev.xdata))
+            return
+        if self._plot_fn is None or not self._plein_ecran:
+            return
+        if self._click_handler is None:
+            self.ouvrir_plein_ecran()
+        else:
+            # laisse une chance au double-clic (analyse detaillee)
+            self._timer_clic.start(260)
+
+    def ouvrir_plein_ecran(self):
+        if self._plot_fn is None:
+            return
+        QToolTip.hideText()
+        info = re.sub(r"(<br>)?\s*<i>[^<]*plein ecran[^<]*</i>", "",
+                      self.toolTip() or "", flags=re.I)
+        dlg = GraphDialog(self.window(), self._plot_fn,
+                          titre=self._titre or "Graphique", info=info)
+        dlg.exec()
+
+
+class GraphDialog(QDialog):
+    """Graphique en plein ecran : legende, survol, valeurs et statistiques."""
+
+    COLS = ["Courbe", "Minimum", "Moyenne", "Maximum", "Total"]
+
+    def __init__(self, parent, plot_fn, titre="Graphique", info=""):
+        super().__init__(parent)
+        self.setWindowTitle(titre)
+        self.setSizeGripEnabled(True)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+
+        entete = QLabel(f"<b style='font-size:13px'>{titre}</b>")
+        entete.setWordWrap(True)
+        lay.addWidget(entete)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+
+        gauche = QWidget(); gl = QVBoxLayout(gauche)
+        gl.setContentsMargins(0, 0, 0, 0)
+        self.cv = MplCanvas(14, 8, plein_ecran=False)
+        gl.addWidget(NavigationToolbar2QT(self.cv, self))
+        gl.addWidget(self.cv, 1)
+        split.addWidget(gauche)
+
+        droite = QWidget(); dl = QVBoxLayout(droite)
+        dl.setContentsMargins(0, 0, 0, 0)
+
+        gv = QGroupBox("Valeurs sous le curseur")
+        gvl = QVBoxLayout(gv)
+        self.lbl_curseur = QLabel("Survolez le graphique pour lire toutes "
+                                  "les valeurs du point le plus proche.")
+        self.lbl_curseur.setWordWrap(True)
+        self.lbl_curseur.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_curseur.setAlignment(Qt.AlignmentFlag.AlignTop |
+                                      Qt.AlignmentFlag.AlignLeft)
+        self.lbl_curseur.setMinimumHeight(150)
+        gvl.addWidget(self.lbl_curseur)
+        dl.addWidget(gv)
+
+        gs = QGroupBox("Toutes les courbes")
+        gsl = QVBoxLayout(gs)
+        self.tbl = QTableWidget(0, len(self.COLS))
+        self.tbl.setHorizontalHeaderLabels(self.COLS)
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setAlternatingRowColors(True)
+        self.tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.tbl.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents)
+        self.tbl.setHorizontalScrollMode(
+            QTableWidget.ScrollMode.ScrollPerPixel)
+        self.tbl.setMinimumWidth(360)
+        gsl.addWidget(self.tbl)
+        dl.addWidget(gs, 1)
+
+        if info:
+            gi = QGroupBox("A propos de ce graphique")
+            gil = QVBoxLayout(gi)
+            lab = QLabel(info); lab.setWordWrap(True)
+            lab.setTextFormat(Qt.TextFormat.RichText)
+            gil.addWidget(lab)
+            dl.addWidget(gi)
+
+        split.addWidget(droite)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 1)
+        split.setSizes([1080, 460])
+        droite.setMinimumWidth(380)
+        lay.addWidget(split, 1)
+
+        btn = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btn.rejected.connect(self.reject)
+        lay.addWidget(btn)
+
+        plot_fn(self.cv)
+        # au-dela de quatre sous-graphes une legende de figure est posee : seule
+        # la mise en page contrainte lui reserve de la place. En deca, le
+        # tight_layout du canevas suffit et resiste mieux aux etiquettes longues.
+        if len(self.cv.fig.axes) > 4:
+            try:
+                self.cv.fig.set_layout_engine("constrained")
+            except Exception:
+                pass
+        self._agrandir_polices()
+        self.cv.completer_legendes()
+        self.cv.set_hover_listener(self._maj_curseur)
+        self.cv.draw()
+        self._remplir_stats(self.cv.statistiques())
+
+        self.resize(1500, 900)
+        self.setWindowState(Qt.WindowState.WindowMaximized)
+
+    def _agrandir_polices(self):
+        """Le plein ecran dispose de place : on remonte les tailles de texte."""
+        fig = self.cv.fig
+        n = max(len(fig.axes), 1)
+        t = 12 if n <= 4 else 10
+        for ax in fig.axes:
+            if ax.get_title():
+                ax.title.set_fontsize(t)
+            ax.xaxis.label.set_fontsize(t - 2)
+            ax.yaxis.label.set_fontsize(t - 2)
+            ax.tick_params(labelsize=t - 3)
+            etiq = [lab.get_text() for lab in ax.get_xticklabels()]
+            if len(etiq) > 8 and any(e and not e.replace(".", "").replace("-", "")
+                                     .isdigit() for e in etiq):
+                ax.tick_params(axis="x", rotation=45)
+        sup = getattr(fig, "_suptitle", None)
+        if sup is not None and len(sup.get_text()) < 60:
+            sup.set_fontsize(12)
+
+    def _maj_curseur(self, html):
+        if not html:
+            self.lbl_curseur.setText(
+                "<span style='color:#94a3b8'>Survolez le graphique pour lire "
+                "toutes les valeurs du point le plus proche.</span>")
+        else:
+            self.lbl_curseur.setText(html)
+
+    def _remplir_stats(self, stats):
+        somme_ok = ("kWh", "EUR", "kWh/an", "kWh/mois", "kWh/jour", "kWh/m2")
+        self.tbl.setRowCount(len(stats))
+        # un meme libelle present dans plusieurs sous-graphes est prefixe par
+        # le nom du sous-graphe (les 12 mois de la journee type, par exemple)
+        groupes = {}
+        for st in stats:
+            groupes.setdefault(st["nom"], set()).add(st["groupe"])
+        for r, s in enumerate(stats):
+            dec = s["dec"]
+            f = lambda v: "-" if not np.isfinite(v) else MplCanvas._nb(v, dec)
+            nom = s["nom"]
+            if s["groupe"] and len(groupes.get(nom, ())) > 1:
+                nom = f"{s['groupe']} - {nom}"
+            titre = f"{nom} ({s['unite']})" if s["unite"] else nom
+            it0 = QTableWidgetItem(titre)
+            if s["couleur"]:
+                it0.setForeground(QColor(s["couleur"]))
+                ft = it0.font(); ft.setBold(True); it0.setFont(ft)
+            self.tbl.setItem(r, 0, it0)
+            it0.setToolTip(f"{s['groupe']}<br>{s['n']} points"
+                           if s["groupe"] else f"{s['n']} points")
+            cells = [f"{f(s['mini'])}" + (f"  ({s['mini_x']})" if s["mini_x"] else ""),
+                     f(s["moy"]),
+                     f"{f(s['maxi'])}" + (f"  ({s['maxi_x']})" if s["maxi_x"] else ""),
+                     f(s["total"]) if s["unite"] in somme_ok else "-"]
+            for c, txt in enumerate(cells, start=1):
+                it = QTableWidgetItem(txt)
+                it.setTextAlignment(Qt.AlignmentFlag.AlignRight |
+                                    Qt.AlignmentFlag.AlignVCenter)
+                self.tbl.setItem(r, c, it)
 
 
 class Worker(QThread):
@@ -300,6 +704,12 @@ def table(headers, tips=None, rows=0, stretch=True):
             it.setToolTip(tip)
     t.setAlternatingRowColors(True)
     return t
+
+
+def court(txt, n=30):
+    """Etiquette raccourcie pour un axe : le nom complet reste dans l'infobulle."""
+    txt = str(txt)
+    return txt if len(txt) <= n else txt[:n - 3] + "..."
 
 
 def item(text, editable=False, align_right=False, bold=False, tip=None,
@@ -506,6 +916,8 @@ class MainWindow(QMainWindow):
         self.worker = None
         self._orient_libres = {}     # index de champ -> autorise a bouger
         self._orient_res = None
+        self._leviers = None         # dernier classement des actions
+        self._attrib = None          # import reseau impute a chaque poste
 
         self.tabs = QTabWidget()
         self.tabs.currentChanged.connect(self._tab_changed)
@@ -519,6 +931,7 @@ class MainWindow(QMainWindow):
         self._build_resultats()
         self._build_optim()
         self._build_orientations()
+        self._build_leviers()
         self._build_toolbar()
 
         self.progress = QProgressBar()
@@ -610,7 +1023,9 @@ class MainWindow(QMainWindow):
         rl.addWidget(self.txt_meteo)
         self.cv_meteo = MplCanvas(7, 4)
         self.cv_meteo.setToolTip(
-            "Survolez un mois pour lire le rayonnement et la temperature.")
+            "Survolez un mois pour lire le rayonnement et la temperature." + HINT)
+        self.cv_meteo.set_plot(self.draw_meteo,
+                               "Rayonnement et temperature mensuels")
         rl.addWidget(self.cv_meteo, 1)
         lay.addWidget(right, 1)
         self.tabs.addTab(w, "1. Site et meteo")
@@ -716,7 +1131,9 @@ class MainWindow(QMainWindow):
             "Survolez un mois pour lire les valeurs exactes.<br>"
             "C'est ici que se voit l'interet d'une forte inclinaison : elle "
             "aplatit la courbe et remonte decembre, le mois qui dimensionne "
-            "une installation autonome.")
+            "une installation autonome." + HINT)
+        self.cv_champs.set_plot(self.draw_champs,
+                                "Production mensuelle par groupe de panneaux")
         lay.addWidget(self.cv_champs, 1)
         self.tabs.addTab(w, "2. Champs PV")
 
@@ -842,9 +1259,15 @@ class MainWindow(QMainWindow):
         self.show_cablage()
         self.draw_champs()
 
-    def draw_champs(self):
+    @staticmethod
+    def _cv(cv, defaut):
+        """Canevas cible : celui passe par la fenetre plein ecran, sinon celui
+        de l'onglet. Les slots Qt passent parfois un int, on l'ignore."""
+        return cv if isinstance(cv, MplCanvas) else defaut
+
+    def draw_champs(self, cv=None):
         """Production mensuelle de chaque groupe de panneaux."""
-        c = self.cv_champs; c.clear()
+        c = self._cv(cv, self.cv_champs); c.clear()
         ax = c.fig.add_subplot(111)
         par_champ = (self.res or {}).get("par_champ") or {}
         if not par_champ:
@@ -863,13 +1286,13 @@ class MainWindow(QMainWindow):
             ax.bar(x, mens, .62, bottom=bas, label=nom,
                    color=couleurs[k % len(couleurs)])
             bas = bas + mens
-            series.append((nom, mens, "kWh", 0))
-        series.append(("<b>Total</b>", bas, "kWh", 0))
+            series.append((nom, mens, "kWh", 0, couleurs[k % len(couleurs)]))
+        series.append(("<b>Total</b>", bas, "kWh", 0, "#334155"))
         besoin = (self.res or {}).get("mensuel", {}).get("besoin")
         if besoin is not None:
             ax.plot(x, besoin, color="#0f172a", lw=1.8, marker="o", ms=3,
                     label="Besoin de la maison")
-            series.append(("Besoin de la maison", besoin, "kWh", 0))
+            series.append(("Besoin de la maison", besoin, "kWh", 0, "#0f172a"))
         ax.set_xticks(x); ax.set_xticklabels(MOIS, fontsize=8)
         ax.set_ylabel("kWh/mois")
         ax.set_title("Production mensuelle par groupe, face au besoin", fontsize=9)
@@ -999,7 +1422,9 @@ class MainWindow(QMainWindow):
             "Survolez la courbe pour lire la date et le niveau exact.<br>"
             "Les creux qui touchent le trait rouge sont les moments ou la "
             "batterie a ete videe et ou le reseau a pris le relais : ce sont "
-            "eux qui determinent la capacite necessaire.")
+            "eux qui determinent la capacite necessaire." + HINT)
+        self.cv_soc.set_plot(self.draw_soc,
+                             "Etat de charge de la batterie sur toute la serie")
         rl.addWidget(self.cv_soc, 1)
         lay.addWidget(right, 1)
         self.tabs.addTab(w, "4. Onduleurs et batterie")
@@ -1190,7 +1615,9 @@ class MainWindow(QMainWindow):
         l1.addWidget(self.tbl_mois)
         self.cv_mois = MplCanvas(9, 3.6)
         self.cv_mois.setToolTip(
-            "Survolez un mois pour lire toutes ses valeurs : production, autoconsommation, soutirage, autonomie.")
+            "Survolez un mois pour lire toutes ses valeurs : production, "
+            "autoconsommation, soutirage, autonomie." + HINT)
+        self.cv_mois.set_plot(self.draw_mois, "Bilan mensuel et autonomie")
         l1.addWidget(self.cv_mois, 1)
         sub.addTab(w1, "Bilan mensuel")
         # journalier
@@ -1229,14 +1656,20 @@ class MainWindow(QMainWindow):
         l2.addWidget(self.tbl_jour, 1)
         self.cv_jour = MplCanvas(9, 3.2)
         self.cv_jour.setToolTip(
-            "Survolez un jour pour lire production, besoin, soutirage, autonomie et niveau de batterie.")
+            "Survolez un jour pour lire production, besoin, soutirage, "
+            "autonomie et niveau de batterie." + HINT)
+        self.cv_jour.set_plot(self.draw_jour, "Detail journalier")
         l2.addWidget(self.cv_jour, 1)
         sub.addTab(w2, "Detail journalier")
         # profil horaire
         w3 = QWidget(); l3 = QVBoxLayout(w3)
         self.cv_profil = MplCanvas(9, 5)
         self.cv_profil.setToolTip(
-            "Journee moyenne de chaque mois, en kW. Survolez une heure pour lire les puissances exactes. L'ecart entre le jaune (production) et le bleu (besoin) montre a quelles heures il faut deplacer les usages.")
+            "Journee moyenne de chaque mois, en kW. Survolez une heure pour "
+            "lire les puissances exactes. L'ecart entre le jaune (production) "
+            "et le bleu (besoin) montre a quelles heures il faut deplacer les "
+            "usages." + HINT)
+        self.cv_profil.set_plot(self.draw_profil, "Journee moyenne de chaque mois")
         l3.addWidget(NavigationToolbar2QT(self.cv_profil, self))
         l3.addWidget(self.cv_profil, 1)
         sub.addTab(w3, "Journee type par mois")
@@ -1262,12 +1695,15 @@ class MainWindow(QMainWindow):
         row.addWidget(self.cb_sweep)
         row.addWidget(QLabel("Valeurs :"))
         self.ed_sweep = QLineEdit("20, 30, 40, 50, 60, 70, 80")
+        self.ed_sweep.setPlaceholderText("Ex. 0,15,30,60,75,90 ou 10:100@5")
         self.ed_sweep.setToolTip(
             "<b>Valeurs a essayer, separees par des virgules.</b><br>"
+            "Accepte aussi un intervalle du type <b>10:100@5</b> pour "
+            "dire de 10 a 100 par pas de 5.<br>"
             "Dans l'unite du parametre choisi a gauche : des degres pour une "
             "inclinaison, des kWc pour une puissance, des kWh pour une "
             "batterie, un nombre entier pour les onduleurs.<br>"
-            "Exemple : 20, 30, 40, 50, 60, 70, 80")
+            "Exemples : 20, 30, 40, 50, 60, 70, 80 ; 10:100@5")
         row.addWidget(self.ed_sweep, 1)
         b = QPushButton("Lancer le balayage")
         b.setToolTip("Relance une simulation complete pour chaque valeur de la "
@@ -1286,7 +1722,7 @@ class MainWindow(QMainWindow):
         self.tbl_sweep = table(
             ["Valeur testee", "Autonomie (%)", "Production (kWh/an)",
              "Import reseau (kWh/an)", "Ecrete (kWh/an)",
-             "Investissement (EUR)", "Retour (ans)"],
+             "Investissement (EUR)", "Retour (ans)", "ROI marginal"],
             tips=[
                 "Valeur donnee au parametre balaye pour cette simulation. "
                 "La meilleure ligne est en gras.",
@@ -1298,13 +1734,376 @@ class MainWindow(QMainWindow):
                 "Cout total issu de la nomenclature de l'onglet 5, recalcule "
                 "pour chaque valeur testee.",
                 "Nombre d'annees pour rembourser l'investissement par les "
-                "economies, face a votre facture actuelle."])
+                "economies, face a votre facture actuelle.",
+                "Taux de rentabilite marginale de l'unite supplementaire : "
+                "gain annuel ajoute / cout supplementaire. Exemple : 0.25 "
+                "signifie un remboursement en 4 ans."])
         lay.addWidget(self.tbl_sweep, 1)
+        sub = QTabWidget()
         self.cv_sweep = MplCanvas(9, 4)
         self.cv_sweep.setToolTip(
-            "Survolez un point pour lire toutes les valeurs de la simulation correspondante.")
-        lay.addWidget(self.cv_sweep, 1)
+            "Profil mois par mois de chaque option testee. Survolez un mois "
+            "pour lire toutes les options a la fois.<br><i>Clic : plein ecran. "
+            "Double-clic : analyse detaillee de la valeur la plus proche.</i>")
+        self.cv_sweep.set_plot(self.draw_sweep, "Balayage : profils mensuels")
+        sub.addTab(self.cv_sweep, "Profils mois par mois")
+
+        self.cv_sweep_bar = MplCanvas(9, 4)
+        self.cv_sweep_bar.setToolTip(
+            "<b>Comparaison directe des options.</b><br>"
+            "Cumuls sur l'annee entiere et moyennes sur les douze mois, plus "
+            "le mois le plus defavorable : c'est lui qui dimensionne une "
+            "installation autonome." + HINT)
+        self.cv_sweep_bar.set_plot(self.draw_sweep_bar,
+                                   "Balayage : comparaison des options")
+        sub.addTab(self.cv_sweep_bar, "Comparaison des options")
+        lay.addWidget(sub, 1)
         self.tabs.addTab(w, "7. Optimisation")
+
+    # ---------------- onglet 9 : leviers ----------------
+    CAT_COULEURS = {"Production": "#d97706", "Stockage": "#7c3aed",
+                    "Consommation": "#0891b2", "Pilotage": "#15803d"}
+
+    def _build_leviers(self):
+        w = QWidget(); lay = QVBoxLayout(w)
+
+        intro = QLabel(
+            "<b>Par quoi commencer pour payer moins de reseau ?</b> "
+            "La partie gauche montre quels appareils causent l'energie achetee ; "
+            "la partie droite chiffre, action par action, ce que rapporterait "
+            "chaque decision, en relancant une simulation complete a chaque fois.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("background:#f1f5f9;padding:6px;border-radius:4px;")
+        lay.addWidget(intro)
+
+        row = QHBoxLayout()
+        lab1 = QLabel("Reduction testee par poste :")
+        self.sp_lev_red = QSpinBox()
+        self.sp_lev_red.setRange(1, 50); self.sp_lev_red.setValue(10)
+        self.sp_lev_red.setSuffix(" %")
+        aide_red = ("<b>De combien fait-on maigrir chaque poste pour mesurer son "
+                    "levier ?</b><br>"
+                    "10 % est un ordre de grandeur atteignable sans travaux "
+                    "(appareil plus recent, usage plus court, consigne plus "
+                    "basse). Le gain affiche est proportionnel : doubler la "
+                    "reduction double a peu pres le gain.")
+        lab1.setToolTip(aide_red); self.sp_lev_red.setToolTip(aide_red)
+        row.addWidget(lab1); row.addWidget(self.sp_lev_red)
+
+        lab2 = QLabel("Talon supprime :")
+        self.sp_lev_talon = QDoubleSpinBox()
+        self.sp_lev_talon.setRange(0, 1000); self.sp_lev_talon.setValue(50)
+        self.sp_lev_talon.setDecimals(0); self.sp_lev_talon.setSuffix(" W")
+        aide_talon = ("<b>Watts permanents que ferait gagner un remplacement "
+                      "d'appareils de fond.</b><br>"
+                      "Un vieux congelateur coffre tire 60 a 90 W en moyenne, un "
+                      "modele recent 25 a 35 W ; un refrigerateur ancien 50 a "
+                      "70 W contre 20 a 25 W aujourd'hui.<br>"
+                      "<i>50 W en continu = 438 kWh/an.</i>")
+        lab2.setToolTip(aide_talon); self.sp_lev_talon.setToolTip(aide_talon)
+        row.addWidget(lab2); row.addWidget(self.sp_lev_talon)
+
+        lab3 = QLabel("Cout de ce remplacement :")
+        self.sp_lev_cout = QDoubleSpinBox()
+        self.sp_lev_cout.setRange(0, 50000); self.sp_lev_cout.setValue(900)
+        self.sp_lev_cout.setDecimals(0); self.sp_lev_cout.setSingleStep(50)
+        self.sp_lev_cout.setSuffix(" EUR")
+        aide_cout = ("<b>Prix suppose du remplacement des appareils de fond.</b><br>"
+                     "Sert a calculer un temps de retour comparable a celui des "
+                     "panneaux et de la batterie. Mettez 0 si le materiel est "
+                     "deja amorti ou recupere.")
+        lab3.setToolTip(aide_cout); self.sp_lev_cout.setToolTip(aide_cout)
+        row.addWidget(lab3); row.addWidget(self.sp_lev_cout)
+
+        b = QPushButton("Analyser les leviers")
+        b.setToolTip(
+            "Simule une a une chaque action possible sur toute la serie meteo "
+            "et les classe par gain annuel. Comptez quelques secondes.")
+        b.clicked.connect(self.run_leviers)
+        row.addWidget(b)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        self.lbl_leviers = QLabel("Lancez une simulation (F5) pour voir d'ou "
+                                  "vient l'energie achetee au reseau.")
+        self.lbl_leviers.setWordWrap(True)
+        self.lbl_leviers.setStyleSheet(
+            "background:#fff7ed;padding:7px;border-radius:4px;")
+        lay.addWidget(self.lbl_leviers)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self.tbl_attrib = table(
+            ["Poste", "Conso (kWh/an)", "Reseau (kWh/an)", "Cout (EUR/an)",
+             "Part achetee", "De nuit"],
+            tips=[
+                "Poste de consommation, ou veille des onduleurs.",
+                "Energie annuelle appelee par ce poste, meteo reelle rejouee.",
+                "Part de l'import reseau imputee a ce poste : a chaque heure, "
+                "l'energie achetee est repartie au prorata des consommations "
+                "de cette heure-la.",
+                "Ce que ce poste coute en achat de reseau, au prix du kWh "
+                "saisi dans l'onglet 5.",
+                "Fraction de ce poste qui vient du reseau plutot que du "
+                "solaire ou de la batterie. Un chiffre eleve signale un usage "
+                "mal place dans la journee.",
+                "Fraction consommee alors que les panneaux ne produisent pas. "
+                "C'est la consommation de fond : elle se paie au reseau ou "
+                "vide la batterie."])
+        split.addWidget(self.tbl_attrib)
+
+        self.tbl_leviers = table(
+            ["Action", "Type", "Reseau evite", "Gain (EUR/an)", "Cout (EUR)",
+             "Retour (ans)", "Gain / 1000 EUR", "Autonomie"],
+            tips=[
+                "Action simulee, une simulation complete par ligne.",
+                "Production = plus de panneaux ou d'onduleurs. Stockage = "
+                "batterie. Consommation = consommer moins. Pilotage = "
+                "consommer au meme moment que le soleil, sans rien acheter.",
+                "Energie qui ne serait plus achetee au reseau, par an.",
+                "Baisse de la facture annuelle : reseau evite, revente et "
+                "bois compris.",
+                "Surcout d'investissement, calcule sur la nomenclature de "
+                "l'onglet 5. Vide quand le cout depend d'une decision que le "
+                "simulateur ne connait pas.",
+                "Annees pour rembourser l'action par le gain annuel.",
+                "Gain annuel rapporte a 1 000 EUR investis : c'est le "
+                "classement a regarder pour arbitrer entre panneaux, batterie "
+                "et remplacement d'appareil.",
+                "Taux d'autonomie annuel apres l'action."])
+        split.addWidget(self.tbl_leviers)
+        # colonnes ajustees a leur contenu : les en-tetes restent lisibles
+        for t in (self.tbl_attrib, self.tbl_leviers):
+            h = t.horizontalHeader()
+            h.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            h.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        split.setSizes([520, 700])
+        split.setMaximumHeight(260)
+        lay.addWidget(split)
+
+        self.cv_leviers = MplCanvas(9, 4)
+        self.cv_leviers.setToolTip(
+            "<b>Consommation de chaque poste</b>, avec la part achetee au "
+            "reseau en rouge.<br><b>Gain annuel de chaque action testee</b>, "
+            "la plus payante en premier." + HINT)
+        self.cv_leviers.set_plot(self.draw_leviers,
+                                 "Leviers : origine de l'import et gain des actions")
+        lay.addWidget(self.cv_leviers, 1)
+        self.tabs.addTab(w, "9. Leviers")
+
+    def run_leviers(self):
+        if self.meteo is None:
+            QMessageBox.information(self, "Meteo", "Chargez d'abord une serie meteo.")
+            return
+        self.pull_config()
+        self._start(Worker(S.leviers, self.cfg, self.meteo,
+                           reduction=self.sp_lev_red.value() / 100.0,
+                           talon_w=self.sp_lev_talon.value(),
+                           cout_remplacement=self.sp_lev_cout.value()),
+                    self._leviers_prets, "Analyse des leviers")
+
+    def _leviers_prets(self, out):
+        self._leviers = out
+        self._attrib = out["attribution"]
+        self.show_leviers()
+        self.tabs.setCurrentIndex(8)
+        self.statusBar().showMessage(
+            f"{len(out['actions'])} actions simulees et classees par gain annuel.",
+            8000)
+
+    def show_leviers(self):
+        """Remplit les deux tableaux, le resume et le graphique de l'onglet 9."""
+        f = lambda v, n=0: f"{v:,.{n}f}".replace(",", " ")
+        at = getattr(self, "_attrib", None) or []
+        lv = getattr(self, "_leviers", None)
+
+        t = self.tbl_attrib; t.setRowCount(len(at))
+        for r, l in enumerate(at):
+            t.setItem(r, 0, item(l["nom"], bold=(r == 0)))
+            t.setItem(r, 1, item(f(l["conso"]), align_right=True))
+            t.setItem(r, 2, item(f(l["import"]), align_right=True, bold=(r == 0)))
+            t.setItem(r, 3, item(f(l["cout_import"]), align_right=True))
+            it = item(f"{100 * l['part_importee']:.0f} %", align_right=True)
+            it.setForeground(QColor("#b91c1c" if l["part_importee"] > .25 else
+                                    "#d97706" if l["part_importee"] > .12 else "#15803d"))
+            t.setItem(r, 4, it)
+            t.setItem(r, 5, item(f"{100 * l['part_nuit']:.0f} %", align_right=True))
+
+        if lv:
+            acts = lv["actions"]
+            t = self.tbl_leviers; t.setRowCount(len(acts))
+            for r, a in enumerate(acts):
+                t.setItem(r, 0, item(a["nom"], tip=a["detail"], bold=(r == 0)))
+                t.setItem(r, 1, item(a["categorie"],
+                                     couleur=self.CAT_COULEURS.get(a["categorie"])))
+                t.setItem(r, 2, item(f(a["import_evite"]), align_right=True))
+                it = item(f(a["gain_an"]), align_right=True, bold=True)
+                it.setForeground(QColor("#15803d" if a["gain_an"] > 0 else "#b91c1c"))
+                t.setItem(r, 3, it)
+                t.setItem(r, 4, item(f(a["cout"]) if a["cout"] > 0 else "a chiffrer",
+                                     align_right=True))
+                t.setItem(r, 5, item(f"{a['retour']:.1f}" if a["retour"] else "-",
+                                     align_right=True))
+                t.setItem(r, 6, item(f"{a['gain_par_1000']:.0f}"
+                                     if a["gain_par_1000"] else "-", align_right=True))
+                t.setItem(r, 7, item(f"{100 * a['autonomie']:.1f} %", align_right=True))
+
+        self.lbl_leviers.setText(self._resume_leviers(at, lv))
+        self.draw_leviers()
+
+    def _resume_leviers(self, at, lv):
+        """Texte de priorites, en francais et en euros."""
+        if not at:
+            return ("Lancez une simulation (F5) pour voir d'ou vient l'energie "
+                    "achetee au reseau.")
+        f = lambda v, n=0: f"{v:,.{n}f}".replace(",", " ")
+        total_imp = sum(l["import"] for l in at)
+        total_cout = sum(l["cout_import"] for l in at)
+        tete = at[:3]
+        part = 100 * sum(l["import"] for l in tete) / max(total_imp, 1e-9)
+        txt = [f"<b>Le reseau vous coute {f(total_cout)} EUR par an</b> "
+               f"({f(total_imp)} kWh achetes). "
+               f"{part:.0f} % de cet achat vient de trois postes : " +
+               ", ".join(f"<b>{l['nom']}</b> ({f(l['cout_import'])} EUR/an, "
+                         f"{100 * l['part_nuit']:.0f} % consomme de nuit)"
+                         for l in tete) + "."]
+        fond = [l for l in at if l["part_nuit"] > .45 and l["conso"] > 300]
+        if fond:
+            txt.append(
+                "Consommation de fond a examiner en premier (plus de 45 % "
+                "consomme quand les panneaux ne produisent pas) : " +
+                ", ".join(f"<b>{l['nom']}</b>" for l in fond) +
+                ". Un appareil de fond remplace par un modele sobre se paie "
+                "toute l'annee, nuit comprise.")
+        if not lv:
+            txt.append("<i>Cliquez sur \"Analyser les leviers\" pour chiffrer "
+                       "chaque action possible et les classer.</i>")
+            return "<br>".join(txt)
+
+        acts = lv["actions"]
+        gagnants = [a for a in acts if a["gain_an"] > 0]
+        gratuits = [a for a in gagnants if a["categorie"] == "Pilotage"]
+        chiffres = [a for a in gagnants if a["gain_par_1000"]]
+        if gratuits:
+            g = sum(a["gain_an"] for a in gratuits)
+            txt.append(
+                f"<b>A cout nul</b> : decaler des usages vers les heures "
+                f"ensoleillees rapporte jusqu'a {f(g)} EUR/an au total (" +
+                ", ".join(f"{a['nom'].split(' : ')[0]} {f(a['gain_an'])} EUR"
+                          for a in gratuits[:3]) + ").")
+        if chiffres:
+            meilleur = max(chiffres, key=lambda a: a["gain_par_1000"])
+            txt.append(
+                f"<b>Meilleur rendement d'un euro investi</b> : "
+                f"{meilleur['nom']} &mdash; {f(meilleur['gain_par_1000'])} EUR "
+                f"gagnes par an pour 1 000 EUR investis, soit un retour en "
+                f"{meilleur['retour']:.1f} ans.")
+        perdants = [a for a in acts if a["gain_an"] <= 0]
+        if perdants:
+            txt.append("Sans effet ou contre-productif ici : " +
+                       ", ".join(a["nom"] for a in perdants[:3]) + ".")
+        txt.append("<i>Les lignes \"a chiffrer\" ne portent pas de cout : le "
+                   "simulateur mesure le gain, a vous de le comparer au devis.</i>")
+        return "<br>".join(txt)
+
+    def draw_leviers(self, cv=None):
+        """Origine de l'import a gauche, gain de chaque action a droite."""
+        c = self._cv(cv, self.cv_leviers); c.clear()
+        at = getattr(self, "_attrib", None) or []
+        lv = getattr(self, "_leviers", None)
+        # cote a cote dans l'onglet (large et peu haut), l'un au-dessus de
+        # l'autre en plein ecran : les noms de postes ont alors toute la place
+        plein = c is not self.cv_leviers
+        ax1 = c.fig.add_subplot(211 if plein else 121)
+        ax2 = c.fig.add_subplot(212 if plein else 122)
+
+        if at:
+            ordre = at[::-1]                      # le plus gros en haut
+            noms = [l["nom"] for l in ordre]
+            y = np.arange(len(noms))
+            auto = np.array([l["autoconso"] for l in ordre])
+            imp = np.array([l["import"] for l in ordre])
+            ax1.barh(y, auto, .62, color="#15803d", label="Couvert par le solaire")
+            ax1.barh(y, imp, .62, left=auto, color="#b91c1c",
+                     label="Achete au reseau")
+            for k, l in enumerate(ordre):
+                if l["cout_import"] >= 1:
+                    ax1.text(auto[k] + imp[k], y[k], f"  {l['cout_import']:,.0f} EUR"
+                             .replace(",", " "), va="center", fontsize=6.5,
+                             color="#b91c1c")
+            ax1.set_yticks(y)
+            ax1.set_yticklabels([court(n, 26) for n in noms], fontsize=7)
+            ax1.set_xlabel("kWh/an")
+            ax1.set_title("Consommation de chaque poste et part achetee au reseau",
+                          fontsize=9)
+            ax1.grid(axis="x", alpha=.2, ls=":")
+            ax1.legend(fontsize=7, frameon=False, loc="lower right")
+            ax1.margins(x=.16)
+            c.hover(ax1, y,
+                    [("Consomme", auto + imp, "kWh/an", 0, "#0f172a"),
+                     ("Couvert par le solaire", auto, "kWh/an", 0, "#15803d"),
+                     ("Achete au reseau", imp, "kWh/an", 0, "#b91c1c"),
+                     ("Cout du reseau", [l["cout_import"] for l in ordre],
+                      "EUR/an", 0, "#b91c1c"),
+                     ("Part achetee", [100 * l["part_importee"] for l in ordre],
+                      "%", 0, None),
+                     ("Consomme de nuit", [100 * l["part_nuit"] for l in ordre],
+                      "%", 0, None)],
+                    xfmt=lambda i: noms[i], titre="Poste", sur="y")
+        else:
+            ax1.text(.5, .5, "Lancez une simulation (F5).", ha="center",
+                     va="center", fontsize=9, color="#94a3b8")
+            ax1.set_xticks([]); ax1.set_yticks([])
+
+        if lv and lv["actions"]:
+            acts = lv["actions"][:14][::-1]
+            noms = [a["nom"] for a in acts]
+            y = np.arange(len(noms))
+            gains = np.array([a["gain_an"] for a in acts])
+            cols = [self.CAT_COULEURS.get(a["categorie"], "#64748b") for a in acts]
+            ax2.barh(y, gains, .62, color=cols)
+            for k, a in enumerate(acts):
+                if a["retour"]:
+                    etiq = f"  retour {a['retour']:.1f} ans"
+                elif a["cout"] > 0:
+                    etiq = "  jamais rembourse"
+                else:
+                    etiq = "  cout a chiffrer"
+                ax2.text(max(gains[k], 0), y[k], etiq, va="center", fontsize=6.5,
+                         color="#475569")
+            ax2.set_yticks(y)
+            ax2.set_yticklabels([court(n, 32) for n in noms], fontsize=7)
+            ax2.set_xlabel("EUR economises par an")
+            ax2.set_title("Gain annuel de chaque action, la plus payante en haut",
+                          fontsize=9)
+            ax2.grid(axis="x", alpha=.2, ls=":")
+            ax2.axvline(0, color="#0f172a", lw=.8)
+            ax2.margins(x=.22)
+            vus = []
+            for cat, coul in self.CAT_COULEURS.items():
+                if any(a["categorie"] == cat for a in acts):
+                    vus.append(matplotlib.patches.Patch(color=coul, label=cat))
+            if vus:
+                ax2.legend(handles=vus, fontsize=7, frameon=False, loc="lower right")
+            c.hover(ax2, y,
+                    [("Gain sur la facture", gains, "EUR/an", 0, "#15803d"),
+                     ("Reseau evite", [a["import_evite"] for a in acts],
+                      "kWh/an", 0, "#b91c1c"),
+                     ("Besoin evite", [a["besoin_evite"] for a in acts],
+                      "kWh/an", 0, "#0891b2"),
+                     ("Cout de l'action", [a["cout"] for a in acts], "EUR", 0, None),
+                     ("Retour", [a["retour"] or float("nan") for a in acts],
+                      "ans", 1, None),
+                     ("Gain pour 1000 EUR", [a["gain_par_1000"] or float("nan")
+                                             for a in acts], "EUR/an", 0, None),
+                     ("Autonomie apres", [100 * a["autonomie"] for a in acts],
+                      "%", 2, "#1f4e79")],
+                    xfmt=lambda i: noms[i], titre="Action", sur="y", cumul=False)
+        else:
+            ax2.text(.5, .5, "Cliquez sur \"Analyser les leviers\" pour chiffrer\n"
+                             "chaque action et les classer par gain annuel.",
+                     ha="center", va="center", fontsize=9, color="#94a3b8")
+            ax2.set_xticks([]); ax2.set_yticks([])
+        c.draw()
 
     # ---------------- onglet 8 : orientation des champs ----------------
     def _build_orientations(self):
@@ -1500,7 +2299,9 @@ class MainWindow(QMainWindow):
             "Survolez la carte pour lire la valeur exacte. La croix marque "
             "l'orientation retenue. Une tache large et plate signifie que "
             "l'orientation de ce groupe importe peu : vous pouvez la choisir "
-            "pour des raisons pratiques.")
+            "pour des raisons pratiques." + HINT)
+        self.cv_orient.set_plot(self.draw_orient,
+                                "Carte du critere par orientation")
         lay.addWidget(self.cv_orient, 1)
 
         for widget in (self.cb_obj, self.cb_effort, self.cb_methode):
@@ -1696,9 +2497,9 @@ class MainWindow(QMainWindow):
             f"<table cellspacing='0' cellpadding='1'>{tab}</table>{note}")
         self.draw_orient()
 
-    def draw_orient(self):
+    def draw_orient(self, cv=None):
         r = self._orient_res
-        c = self.cv_orient; c.clear()
+        c = self._cv(cv, self.cv_orient); c.clear()
         grilles = (r or {}).get("grilles") or {}
         if not grilles:
             c.draw(); return
@@ -1855,17 +2656,27 @@ class MainWindow(QMainWindow):
             f"Degres-jours base 17 C : <b>{s['dju_17']:,.0f}</b><br>"
             f"<i>Les composantes sont horizontales : toute inclinaison est calculee "
             f"localement, sans nouveau telechargement.</i>".replace(",", " "))
-        c = self.cv_meteo; c.clear()
+        self.draw_meteo()
+
+    def draw_meteo(self, cv=None):
+        """Rayonnement et temperature mensuels de la serie meteo chargee."""
+        if not self.meteo:
+            return
+        s = M.meteo_summary(self.meteo)
+        c = self._cv(cv, self.cv_meteo); c.clear()
         ax = c.fig.add_subplot(111)
-        ax.bar(MOIS, s["ghi_mensuel"], color="#fbbf24")
+        ax.bar(MOIS, s["ghi_mensuel"], color="#fbbf24",
+               label="Rayonnement horizontal (kWh/m2/mois)")
         ax.set_ylabel("kWh/m2/mois"); ax.set_title("Rayonnement horizontal mensuel moyen")
+        ax.grid(axis="y", alpha=.2, ls=":")
         ax2 = ax.twinx()
         tm = [self.meteo["T2m"][self.meteo["month"] == k + 1].mean() for k in range(12)]
-        ax2.plot(MOIS, tm, color="#b91c1c", marker="o")
+        ax2.plot(MOIS, tm, color="#b91c1c", marker="o",
+                 label="Temperature moyenne (C)")
         ax2.set_ylabel("Temperature moyenne (C)", color="#b91c1c")
         c.hover([ax, ax2], np.arange(12),
-                [("Rayonnement horizontal", s["ghi_mensuel"], "kWh/m2", 0),
-                 ("Temperature moyenne", tm, "C", 1)],
+                [("Rayonnement horizontal", s["ghi_mensuel"], "kWh/m2", 0, "#fbbf24"),
+                 ("Temperature moyenne", tm, "C", 1, "#b91c1c")],
                 xfmt=lambda i: MOIS[i], titre="Moyenne mensuelle")
         c.draw()
 
@@ -1897,7 +2708,15 @@ class MainWindow(QMainWindow):
         except Exception:
             QMessageBox.critical(self, "Erreur", traceback.format_exc()[-2500:])
             return
+        # le classement des leviers portait sur l'ancienne configuration
+        self._leviers = None
         self.show_results()
+
+    def _retour_txt(self, retour, d=1):
+        """Temps de retour en annees decimales, ou '>horizon' si jamais rembourse."""
+        if retour is not None:
+            return f"{retour:.{d}f}"
+        return ">" + str(self.cfg["economie"].get("duree_analyse_ans", 25))
 
     def show_results(self):
         r, k, e = self.res, self.res["kpi"], self.res["eco"]
@@ -1915,7 +2734,7 @@ class MainWindow(QMainWindow):
             f"<td><span style='font-size:20pt'><b>{f(e['capex'])} EUR</b></span>"
             f"<br><small>INVESTISSEMENT</small></td>"
             f"<td><span style='font-size:20pt'><b>"
-            f"{e['retour_ans_vs_actuel'] or '>' + str(self.cfg['economie']['duree_analyse_ans'])} ans</b>"
+            f"{self._retour_txt(e['retour_ans_vs_actuel'])} ans</b>"
             f"</span><br><small>RETOUR / FACTURE ACTUELLE</small></td>"
             f"</tr></table>")
 
@@ -1969,12 +2788,15 @@ class MainWindow(QMainWindow):
             self.cb_annee.setCurrentText(cur)
         self.cb_annee.blockSignals(False)
         self.draw_jour()
+        self._attrib = S.attribution_import(
+            r, self.meteo, float(self.cfg["economie"]["prix_kwh_achat"]))
+        self.show_leviers()
         self.statusBar().showMessage(
             f"Simulation terminee sur {k['n_years']:.0f} annees de meteo reelle.", 6000)
 
-    def draw_mois(self):
+    def draw_mois(self, cv=None):
         m = self.res["mensuel"]
-        c = self.cv_mois; c.clear()
+        c = self._cv(cv, self.cv_mois); c.clear()
         ax = c.fig.add_subplot(121)
         x = np.arange(12)
         ax.bar(x, m["autoconso"], .6, label="Autoconsomme", color="#15803d")
@@ -1984,31 +2806,35 @@ class MainWindow(QMainWindow):
         ax.set_xticks(x); ax.set_xticklabels(MOIS, fontsize=7)
         ax.set_ylabel("kWh/mois"); ax.legend(fontsize=7, frameon=False)
         ax.set_title("Bilan mensuel", fontsize=9)
+        ax.grid(axis="y", alpha=.2, ls=":")
         ax2 = c.fig.add_subplot(122)
         cols = ["#15803d" if a > .9 else "#d97706" if a > .7 else "#b91c1c"
                 for a in m["autonomie"]]
         ax2.bar(x, 100 * m["autonomie"], .6, color=cols)
-        ax2.axhline(100 * float(self.cfg["options"].get("autonomie_cible", .92)),
-                    color=BLEU, ls="--", lw=1)
+        cible = 100 * float(self.cfg["options"].get("autonomie_cible", .92))
+        ax2.axhline(cible, color=BLEU, ls="--", lw=1,
+                    label=f"Objectif {cible:.0f} %")
+        ax2.bar([], [], color="#15803d", label="Autonomie du mois")
+        ax2.grid(axis="y", alpha=.2, ls=":")
         ax2.set_xticks(x); ax2.set_xticklabels(MOIS, fontsize=7)
         ax2.set_ylim(0, 105); ax2.set_ylabel("%")
         ax2.set_title("Autonomie mensuelle", fontsize=9)
         c.hover(ax, x,
-                [("Production", m["production_dc"], "kWh", 0),
-                 ("Autoconsomme", m["autoconso"], "kWh", 0),
-                 ("Soutire au reseau", m["import"], "kWh", 0),
-                 ("Besoin total", m["besoin"], "kWh", 0),
-                 ("Ecrete / injecte", m["ecrete"] + m["export"], "kWh", 0),
-                 ("Autonomie", 100 * m["autonomie"], "%", 1)],
+                [("Production", m["production_dc"], "kWh", 0, "#d97706"),
+                 ("Autoconsomme", m["autoconso"], "kWh", 0, "#15803d"),
+                 ("Soutire au reseau", m["import"], "kWh", 0, "#b91c1c"),
+                 ("Besoin total", m["besoin"], "kWh", 0, "#0f172a"),
+                 ("Ecrete / injecte", m["ecrete"] + m["export"], "kWh", 0, "#7c3aed"),
+                 ("Autonomie", 100 * m["autonomie"], "%", 1, BLEU)],
                 xfmt=lambda i: MOIS[i], titre="Bilan mensuel")
         c.hover(ax2, x,
-                [("Autonomie", 100 * m["autonomie"], "%", 1),
-                 ("Besoin total", m["besoin"], "kWh", 0),
-                 ("Soutire au reseau", m["import"], "kWh", 0)],
+                [("Autonomie", 100 * m["autonomie"], "%", 1, BLEU),
+                 ("Besoin total", m["besoin"], "kWh", 0, "#0f172a"),
+                 ("Soutire au reseau", m["import"], "kWh", 0, "#b91c1c")],
                 xfmt=lambda i: MOIS[i], titre="Autonomie mensuelle")
         c.draw()
 
-    def draw_jour(self):
+    def draw_jour(self, cv=None):
         if not self.res:
             return
         j = self.res["journalier"]
@@ -2034,7 +2860,7 @@ class MainWindow(QMainWindow):
                                     "#d97706" if a > .7 else "#b91c1c"))
             t.setItem(r, 5, it)
             t.setItem(r, 6, item(f(j["soc_min"][i]), align_right=True))
-        c = self.cv_jour; c.clear()
+        c = self._cv(cv, self.cv_jour); c.clear()
         ax = c.fig.add_subplot(111)
         d = np.arange(1, len(sel) + 1)
         ax.bar(d, j["production"][sel], .7, color="#fbbf24", label="Production")
@@ -2044,20 +2870,20 @@ class MainWindow(QMainWindow):
         ax.set_xlabel(f"Jour de {MOIS[mo - 1]} {year}"); ax.set_ylabel("kWh/jour")
         ax.legend(fontsize=7, frameon=False)
         c.hover(ax, d,
-                [("Production", j["production"][sel], "kWh", 1),
-                 ("Besoin total", j["besoin"][sel], "kWh", 1),
-                 ("Consommation usages", j["consommation"][sel], "kWh", 1),
-                 ("Soutire au reseau", j["import"][sel], "kWh", 1),
-                 ("Autonomie", 100 * j["autonomie"][sel], "%", 0),
-                 ("Charge minimale batterie", j["soc_min"][sel], "kWh", 1)],
+                [("Production", j["production"][sel], "kWh", 1, "#fbbf24"),
+                 ("Besoin total", j["besoin"][sel], "kWh", 1, BLEU),
+                 ("Consommation usages", j["consommation"][sel], "kWh", 1, "#0891b2"),
+                 ("Soutire au reseau", j["import"][sel], "kWh", 1, "#b91c1c"),
+                 ("Autonomie", 100 * j["autonomie"][sel], "%", 0, "#15803d"),
+                 ("Charge minimale batterie", j["soc_min"][sel], "kWh", 1, "#7c3aed")],
                 xfmt=lambda i: f"{MOIS[mo - 1]} {int(d[i])}, {year}",
                 titre="Journee")
         c.draw()
 
-    def draw_profil(self):
+    def draw_profil(self, cv=None):
         r = self.res
         met = self.meteo
-        c = self.cv_profil; c.clear()
+        c = self._cv(cv, self.cv_profil); c.clear()
         axes = c.fig.subplots(3, 4, sharex=True)
         d = r["dispatch"]
         for k in range(12):
@@ -2066,19 +2892,22 @@ class MainWindow(QMainWindow):
             prof_p = [r["pv_dc"][sel & (met["hour"] == h)].mean() for h in range(24)]
             prof_c = [d["besoin_total"][sel & (met["hour"] == h)].mean() for h in range(24)]
             prof_i = [d["import"][sel & (met["hour"] == h)].mean() for h in range(24)]
-            ax.fill_between(range(24), prof_p, color="#fbbf24", alpha=.8)
-            ax.plot(range(24), prof_c, color=BLEU, lw=1.4)
-            ax.fill_between(range(24), prof_i, color="#b91c1c", alpha=.6)
+            ax.fill_between(range(24), prof_p, color="#fbbf24", alpha=.8,
+                            label="Production PV" if k == 0 else None)
+            ax.plot(range(24), prof_c, color=BLEU, lw=1.4,
+                    label="Besoin" if k == 0 else None)
+            ax.fill_between(range(24), prof_i, color="#b91c1c", alpha=.6,
+                            label="Soutire au reseau" if k == 0 else None)
+            ax.grid(alpha=.18, ls=":")
             ax.set_title(MOIS[k], fontsize=8)
             ax.tick_params(labelsize=6)
             c.hover(ax, np.arange(24),
-                    [("Production PV", prof_p, "kW", 2),
-                     ("Besoin", prof_c, "kW", 2),
-                     ("Soutire au reseau", prof_i, "kW", 2)],
+                    [("Production PV", prof_p, "kW", 2, "#fbbf24"),
+                     ("Besoin", prof_c, "kW", 2, BLEU),
+                     ("Soutire au reseau", prof_i, "kW", 2, "#b91c1c")],
                     xfmt=lambda i: f"{i:02d} h - {(i + 1) % 24:02d} h",
                     titre=f"{MOIS[k]}, journee moyenne")
-        c.fig.suptitle("Journee moyenne : production (jaune), besoin (bleu), "
-                       "soutirage (rouge) - kW", fontsize=9)
+        c.fig.suptitle("Journee moyenne de chaque mois, en kW", fontsize=9)
         c.draw()
 
     def show_sys(self):
@@ -2103,22 +2932,33 @@ class MainWindow(QMainWindow):
             f"<b>Reseau</b> : soutirage {f(k['import_an'])} kWh/an &bull; "
             f"ecrete {f(k['ecrete_an'])} kWh/an &bull; "
             f"injecte {f(k['export_an'])} kWh/an")
-        c = self.cv_soc; c.clear()
+        self.draw_soc()
+
+    def draw_soc(self, cv=None):
+        """Etat de charge de la batterie sur toute la serie meteo."""
+        if not self.res:
+            return
+        d = self.res["dispatch"]
+        c = self._cv(cv, self.cv_soc); c.clear()
         ax = c.fig.add_subplot(111)
         soc = d["soc"]
         n = len(soc)
         step = max(n // 4000, 1)
-        ax.plot(np.arange(0, n, step) / 24.0, soc[::step], lw=.5, color=BLEU)
-        ax.axhline(d["soc_min"], color="#b91c1c", ls="--", lw=1)
-        ax.axhline(d["soc_max"], color="#15803d", ls="--", lw=1)
+        ax.plot(np.arange(0, n, step) / 24.0, soc[::step], lw=.5, color=BLEU,
+                label="Etat de charge (kWh)")
+        ax.axhline(d["soc_min"], color="#b91c1c", ls="--", lw=1,
+                   label=f"Plancher {d['soc_min']:.1f} kWh")
+        ax.axhline(d["soc_max"], color="#15803d", ls="--", lw=1,
+                   label=f"Plafond {d['soc_max']:.1f} kWh")
+        ax.grid(alpha=.2, ls=":")
         ax.set_xlabel("Jour de la serie"); ax.set_ylabel("Etat de charge (kWh)")
         ax.set_title("Etat de charge de la batterie sur toute la serie", fontsize=9)
         jours = np.arange(0, n, step) / 24.0
         dates = self.meteo["dt_loc"][::step]
         c.hover(ax, jours,
-                [("Etat de charge", soc[::step], "kWh", 1),
+                [("Etat de charge", soc[::step], "kWh", 1, BLEU),
                  ("Remplissage", 100 * (soc[::step] - d["soc_min"]) /
-                  max(d["utile"], 1e-9), "%", 0)],
+                  max(d["utile"], 1e-9), "%", 0, "#15803d")],
                 xfmt=lambda i: str(dates[i].astype("datetime64[h]")).replace("T", " a ") + " h",
                 titre="Batterie")
         c.draw()
@@ -2140,10 +2980,10 @@ class MainWindow(QMainWindow):
             f"<td>dont bois {f(e['cout_bois'])} EUR ({e['steres']:.1f} steres)</td></tr>"
             f"<tr><td>Economie vs facture actuelle</td><td align=right><b>"
             f"{f(e['economie_vs_actuel'])} EUR/an</b></td>"
-            f"<td>retour {e['retour_ans_vs_actuel'] or '>' + str(horizon)} ans</td></tr>"
+            f"<td>retour {self._retour_txt(e['retour_ans_vs_actuel'])} ans</td></tr>"
             f"<tr><td>Economie vs tout-electrique sans PV</td><td align=right>"
             f"{f(e['economie_vs_sans_pv'])} EUR/an</td>"
-            f"<td>retour {e['retour_ans_vs_sans_pv'] or '>' + str(horizon)} ans</td></tr>"
+            f"<td>retour {self._retour_txt(e['retour_ans_vs_sans_pv'])} ans</td></tr>"
             f"<tr><td>Gain cumule a {horizon} ans</td><td align=right><b>"
             f"{f(e['gain_cumule_horizon'])} EUR</b></td><td></td></tr>"
             f"<tr><td>Cout du kWh autoproduit utilise</td><td align=right>"
@@ -2161,17 +3001,92 @@ class MainWindow(QMainWindow):
         self.pull_config()
         var = self.cb_sweep.currentData()
         try:
-            vals = [float(x) for x in self.ed_sweep.text().replace(";", ",").split(",")
-                    if x.strip()]
-        except ValueError:
-            QMessageBox.warning(self, "Valeurs", "Saisissez des nombres separes par des virgules.")
+            vals = S.parse_sweep_values(self.ed_sweep.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Valeurs", str(exc))
             return
         if not vals:
             return
         self._start(Worker(S.sweep, self.cfg, self.meteo, var, vals),
                     lambda out: self.show_sweep(var, out), "Balayage")
 
+    def open_sweep_detail(self, out, xval):
+        candidates = out
+        sel = min(candidates, key=lambda o: abs(float(o["valeur"]) - float(xval)))
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Analyse detaillee — {float(sel['valeur']):g}")
+        dlg.resize(1100, 700)
+        lay = QVBoxLayout(dlg)
+        html = (
+            f"<b>Valeur :</b> {float(sel['valeur']):g}<br>"
+            f"<b>Autonomie :</b> {100 * sel['autonomie']:.2f} %<br>"
+            f"<b>Production :</b> {sel['production']:.0f} kWh/an<br>"
+            f"<b>Import reseau :</b> {sel['import']:.0f} kWh/an<br>"
+            f"<b>Ecrete :</b> {sel['ecrete']:.0f} kWh/an<br>"
+            f"<b>Investissement :</b> {sel['capex']:.0f} EUR<br>"
+            f"<b>Retour :</b> {self._retour_txt(sel['retour'])} ans<br>"
+            f"<b>ROI marginal :</b> {sel['rentabilite_marginale']:.3f}"
+        )
+        lab = QLabel(html)
+        lay.addWidget(lab)
+
+        cv = MplCanvas(10, 5)
+        months = list(MOIS)
+        prod = np.asarray(sel["production_mensuel"]) / 1000.0
+        aut = np.asarray(sel["autonomie_mensuel"]) * 100.0
+        imp = np.asarray(sel["import_mensuel"])
+        ax1 = cv.fig.add_subplot(2, 2, 1)
+        ax1.plot(months, prod, marker="o", color=BLEU, lw=2)
+        ax1.set_title("Production mensuelle")
+        ax1.set_ylabel("MWh/mois")
+        ax1.grid(alpha=.25, ls=":")
+        ax1.tick_params(axis="x", rotation=30)
+
+        ax2 = cv.fig.add_subplot(2, 2, 2)
+        ax2.plot(months, aut, marker="o", color=VERT, lw=2)
+        ax2.set_title("Taux d'autonomie")
+        ax2.set_ylabel("%")
+        ax2.grid(alpha=.25, ls=":")
+        ax2.tick_params(axis="x", rotation=30)
+
+        ax3 = cv.fig.add_subplot(2, 2, 3)
+        ax3.plot(months, imp, marker="o", color=ORANGE, lw=2)
+        ax3.set_title("Import reseau")
+        ax3.set_ylabel("kWh/mois")
+        ax3.grid(alpha=.25, ls=":")
+        ax3.tick_params(axis="x", rotation=30)
+
+        ax4 = cv.fig.add_subplot(2, 2, 4)
+        ax4.axis("off")
+        ax4.text(0.02, 0.95, "Synthese", fontsize=10, fontweight="bold", va="top")
+        ax4.text(0.02, 0.75, f"Autonomie : {100 * sel['autonomie']:.2f}%", va="top")
+        ax4.text(0.02, 0.60, f"Production : {sel['production']:.0f} kWh/an", va="top")
+        ax4.text(0.02, 0.45, f"Import : {sel['import']:.0f} kWh/an", va="top")
+        ax4.text(0.02, 0.30, f"Ecrete : {sel['ecrete']:.0f} kWh/an", va="top")
+        ax4.text(0.02, 0.15, f"ROI marginal : {sel['rentabilite_marginale']:.3f}", va="top")
+
+        mens = lambda i: MOIS[i]
+        for a, lab, vals, unite, dec, col in (
+                (ax1, "Production", prod, "MWh", 3, BLEU),
+                (ax2, "Autonomie", aut, "%", 2, VERT),
+                (ax3, "Import reseau", imp, "kWh", 0, ORANGE)):
+            cv.hover(a, np.arange(12),
+                     [(lab, vals, unite, dec, col),
+                      ("Production", prod, "MWh", 3, BLEU),
+                      ("Autonomie", aut, "%", 2, VERT),
+                      ("Import reseau", imp, "kWh", 0, ORANGE)][1:],
+                     xfmt=mens, titre=f"{float(sel['valeur']):g} - mois")
+        cv.draw()
+        lay.addWidget(cv, 1)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btn_box.rejected.connect(dlg.reject)
+        lay.addWidget(btn_box)
+        dlg.exec()
+
     def show_sweep(self, var, out):
+        if not out:
+            return
         t = self.tbl_sweep; t.setRowCount(len(out))
         f = lambda v, n=0: f"{v:,.{n}f}".replace(",", " ")
         best = max(range(len(out)), key=lambda i: out[i]["autonomie"])
@@ -2181,36 +3096,200 @@ class MainWindow(QMainWindow):
                                  bold=(r == best)))
             for c, key in enumerate(["production", "import", "ecrete", "capex"], start=2):
                 t.setItem(r, c, item(f(o[key]), align_right=True))
-            t.setItem(r, 6, item(o["retour"] if o["retour"] else "-", align_right=True))
-        c = self.cv_sweep; c.clear()
-        ax = c.fig.add_subplot(111)
-        x = [o["valeur"] for o in out]
-        ax.plot(x, [100 * o["autonomie"] for o in out], marker="o", color=BLEU,
-                lw=2, label="Autonomie")
-        ax.set_xlabel(self.cb_sweep.currentText()); ax.set_ylabel("Autonomie (%)")
-        ax.grid(alpha=.3, ls=":")
-        ax.scatter([x[best]], [100 * out[best]["autonomie"]], s=140,
-                   facecolors="none", edgecolors="#15803d", lw=2, zorder=5)
-        ax2 = ax.twinx()
-        ax2.plot(x, [o["production"] for o in out], color="#d97706", ls="--",
-                 label="Production kWh/an")
-        ax2.plot(x, [o["ecrete"] for o in out], color="#94a3b8", ls=":",
-                 label="Ecrete kWh/an")
-        ax2.set_ylabel("kWh/an")
-        h1, l1 = ax.get_legend_handles_labels(); h2, l2 = ax2.get_legend_handles_labels()
-        ax.legend(h1 + h2, l1 + l2, fontsize=8, frameon=False, loc="lower right")
-        ax.set_title(f"Optimum : {x[best]:g} -> {100 * out[best]['autonomie']:.2f} % "
-                     f"d'autonomie", fontsize=10, color=BLEU)
-        series = [("Autonomie", [100 * o["autonomie"] for o in out], "%", 2),
-                  ("Production", [o["production"] for o in out], "kWh/an", 0),
-                  ("Soutire au reseau", [o["import"] for o in out], "kWh/an", 0),
-                  ("Ecrete", [o["ecrete"] for o in out], "kWh/an", 0),
-                  ("Investissement", [o["capex"] for o in out], "EUR", 0)]
-        libelle = self.cb_sweep.currentText()
-        c.hover([ax, ax2], x, series,
-                xfmt=lambda i: f"{x[i]:g}", titre=libelle)
-        c.draw()
+            t.setItem(r, 6, item(self._retour_txt(o["retour"]), align_right=True))
+            t.setItem(r, 7, item(f"{o['rentabilite_marginale']:.3f}", align_right=True))
+        self._sweep_out, self._sweep_var = out, var
+        self._sweep_libelle = self.cb_sweep.currentText()
+        self.draw_sweep()
+        self.draw_sweep_bar()
         self.tabs.setCurrentIndex(6)
+
+    def draw_sweep(self, cv=None):
+        """Balayage d'un parametre : profils mensuels et rentabilite marginale."""
+        out = getattr(self, "_sweep_out", None)
+        if not out:
+            return
+        libelle = getattr(self, "_sweep_libelle", None) or self.cb_sweep.currentText()
+        c = self._cv(cv, self.cv_sweep); c.clear()
+        fig = c.fig
+        ax1 = fig.add_subplot(2, 2, 1)
+        ax2 = fig.add_subplot(2, 2, 2)
+        ax3 = fig.add_subplot(2, 2, 3)
+        ax4 = fig.add_subplot(2, 2, 4)
+        x = [float(o["valeur"]) for o in out]
+        mois = list(MOIS)
+        cmap = matplotlib.colormaps["viridis"]
+        couleurs = [matplotlib.colors.to_hex(cmap(t))
+                    for t in np.linspace(0, .88, max(len(out), 1))]
+        s_prod, s_aut, s_imp = [], [], []
+        for i, o in enumerate(out):
+            col = couleurs[i]
+            lab = f"{o['valeur']:g}"
+            prod = np.asarray(o["production_mensuel"], dtype=float) / 1000.0
+            aut = [100 * a for a in o["autonomie_mensuel"]]
+            imp = np.asarray(o["import_mensuel"], dtype=float)
+            ax1.plot(mois, prod, label=lab, color=col, lw=1.6, marker="o", ms=2.5)
+            ax2.plot(mois, aut, label=lab, color=col, lw=1.6, marker="o", ms=2.5)
+            ax3.plot(mois, imp, label=lab, color=col, lw=1.6, marker="o", ms=2.5)
+            s_prod.append((lab, prod, "MWh", 3, col))
+            s_aut.append((lab, aut, "%", 1, col))
+            s_imp.append((lab, imp, "kWh", 0, col))
+        ax1.set_ylabel("Production (MWh/mois)")
+        ax1.set_title("Production mensuelle")
+        ax1.grid(alpha=.25, ls=":")
+        ax2.set_ylabel("Autonomie (%)")
+        ax2.set_title("Taux d'autonomie mensuel")
+        ax2.grid(alpha=.25, ls=":")
+        ax3.set_ylabel("Import reseau (kWh/mois)")
+        ax3.set_title("Energie importee du reseau")
+        ax3.grid(alpha=.25, ls=":")
+        ax4.plot(x, [o["rentabilite_marginale"] for o in out], marker="o", lw=2,
+                 color="#16a34a", label="ROI marginal")
+        ax4.axhline(0, color="black", lw=0.5, alpha=0.35)
+        ax4.set_title("ROI marginal / unite supplementaire")
+        ax4.set_xlabel(libelle)
+        ax4.set_ylabel("Facteur")
+        ax4.grid(alpha=.25, ls=":")
+        for ax in (ax1, ax2, ax3):
+            ax.tick_params(axis="x", rotation=30)
+        if len(out) <= 8 or cv is not None:
+            for ax in (ax1, ax2, ax3):
+                ax.legend(loc="upper left", fontsize=6.5, frameon=False,
+                          ncol=2 if len(out) > 6 else 1, title=libelle,
+                          title_fontsize=6.5)
+        best = max(range(len(out)), key=lambda i: out[i]["autonomie"])
+        fig.suptitle(f"Optimum : {x[best]:g} -> {100 * out[best]['autonomie']:.2f} % d'autonomie",
+                     fontsize=10, color=BLEU)
+        c.set_click_handler(lambda xdata: self.open_sweep_detail(out, xdata))
+        mens = lambda i: MOIS[i]
+        c.hover(ax1, np.arange(12), s_prod, xfmt=mens,
+                titre="Production mensuelle")
+        c.hover(ax2, np.arange(12), s_aut, xfmt=mens,
+                titre="Autonomie mensuelle")
+        c.hover(ax3, np.arange(12), s_imp, xfmt=mens,
+                titre="Import reseau mensuel")
+        c.hover(ax4, x,
+                [("Autonomie", [100 * o["autonomie"] for o in out], "%", 2, "#15803d"),
+                 ("Production", [o["production"] for o in out], "kWh/an", 0, "#d97706"),
+                 ("Soutire au reseau", [o["import"] for o in out], "kWh/an", 0, "#b91c1c"),
+                 ("Ecrete", [o["ecrete"] for o in out], "kWh/an", 0, "#7c3aed"),
+                 ("Investissement", [o["capex"] for o in out], "EUR", 0, "#0f172a"),
+                 ("ROI marginal", [o["rentabilite_marginale"] for o in out],
+                  "facteur", 3, "#16a34a")],
+                xfmt=lambda i: f"{libelle} = {x[i]:g}", titre="Bilan annuel",
+                cumul=False)
+        c.draw()
+
+    def draw_sweep_bar(self, cv=None):
+        """Histogrammes comparant les options entre elles : cumuls annuels,
+        moyennes sur les douze mois, autonomie et economie."""
+        out = getattr(self, "_sweep_out", None)
+        c = self._cv(cv, self.cv_sweep_bar); c.clear()
+        if not out:
+            ax = c.fig.add_subplot(111)
+            ax.text(.5, .5, "Lancez un balayage pour comparer les options.",
+                    ha="center", va="center", fontsize=9, color="#94a3b8")
+            ax.set_xticks([]); ax.set_yticks([])
+            c.draw()
+            return
+        libelle = getattr(self, "_sweep_libelle", None) or self.cb_sweep.currentText()
+        x = np.arange(len(out))
+        etiq = [f"{o['valeur']:g}" for o in out]
+        entete = lambda i: f"{libelle} = {etiq[i]}"
+
+        prod = np.array([o["production"] for o in out]) / 1000.0
+        ecrete = np.array([o["ecrete"] for o in out]) / 1000.0
+        utile = prod - ecrete
+        imp = np.array([o["import"] for o in out])
+        imp_mens = np.array([o["import_mensuel"] for o in out], dtype=float)
+        imp_moy = imp_mens.mean(axis=1)
+        imp_pire = imp_mens.max(axis=1)
+        aut = np.array([100 * o["autonomie"] for o in out])
+        aut_mens = np.array([o["autonomie_mensuel"] for o in out], dtype=float) * 100
+        aut_moy = aut_mens.mean(axis=1)
+        aut_min = aut_mens.min(axis=1)
+        prod_mens = np.array([o["production_mensuel"] for o in out], dtype=float)
+        eco = np.array([o.get("economie_vs_actuel", 0.0) for o in out])
+        retour = np.array([o["retour"] if o["retour"] else np.nan for o in out],
+                          dtype=float)
+        capex = np.array([o["capex"] for o in out])
+
+        def barres(ax, series, titre, ylabel, legende=True):
+            """Barres groupees : une couleur par grandeur, un groupe par option."""
+            n = len(series)
+            w = .8 / n
+            for k, (lab, vals, coul) in enumerate(series):
+                ax.bar(x + (k - (n - 1) / 2) * w, vals, w * .92, label=lab,
+                       color=coul)
+            ax.set_xticks(x)
+            ax.set_xticklabels(etiq, fontsize=7,
+                               rotation=45 if len(out) > 8 else 0)
+            ax.set_title(titre, fontsize=9)
+            ax.set_ylabel(ylabel)
+            ax.grid(axis="y", alpha=.2, ls=":")
+            ax.margins(y=.24)          # de la place en haut pour la legende
+            if legende:
+                ax.legend(fontsize=7, frameon=False, ncol=1, loc="best")
+
+        ax1 = c.fig.add_subplot(2, 2, 1)
+        barres(ax1, [("Utilisee (autoconso + batterie)", utile, "#15803d"),
+                     ("Ecretee, perdue", ecrete, "#7c3aed")],
+               "Production cumulee sur l'annee", "MWh/an")
+
+        ax2 = c.fig.add_subplot(2, 2, 2)
+        barres(ax2, [("Cumul sur l'annee", imp, "#b91c1c"),
+                     ("Moyenne d'un mois", imp_moy, "#f97316"),
+                     ("Mois le plus mauvais", imp_pire, "#0f172a")],
+               "Energie achetee au reseau", "kWh")
+
+        ax3 = c.fig.add_subplot(2, 2, 3)
+        barres(ax3, [("Sur l'annee entiere", aut, "#15803d"),
+                     ("Moyenne des 12 mois", aut_moy, "#0891b2"),
+                     ("Mois le plus faible", aut_min, "#b91c1c")],
+               "Autonomie", "%")
+        cible = 100 * float(self.cfg["options"].get("autonomie_cible", .92))
+        ax3.axhline(cible, color=BLEU, ls="--", lw=1, label=f"Objectif {cible:.0f} %")
+        ax3.legend(fontsize=7, frameon=False, ncol=2, loc="lower right")
+        ax3.set_ylim(0, 128)
+
+        ax4 = c.fig.add_subplot(2, 2, 4)
+        barres(ax4, [("Economie annuelle", eco, "#15803d")],
+               "Economie et temps de retour", "EUR/an", legende=False)
+        ax4b = ax4.twinx()
+        ax4b.plot(x, retour, color=BLEU, marker="o", ms=4, lw=1.6,
+                  label="Retour (ans)")
+        ax4b.set_ylabel("Retour (ans)", color=BLEU)
+        ax4b.tick_params(axis="y", labelcolor=BLEU)
+        ax4.set_xlabel(libelle)
+        h4 = ax4.get_legend_handles_labels()
+        h4b = ax4b.get_legend_handles_labels()
+        ax4.legend(h4[0] + h4b[0], h4[1] + h4b[1], fontsize=7, frameon=False,
+                   loc="lower right")
+
+        best = int(np.argmax(aut))
+        c.fig.suptitle(
+            f"Comparaison des {len(out)} options &mdash; meilleure autonomie : "
+            f"{etiq[best]} ({aut[best]:.2f} %)".replace("&mdash;", "-"),
+            fontsize=10, color=BLEU)
+
+        series = [("Production utilisee", utile, "MWh/an", 2, "#15803d"),
+                  ("Production ecretee", ecrete, "MWh/an", 2, "#7c3aed"),
+                  ("Production totale", prod, "MWh/an", 2, "#d97706"),
+                  ("Reseau sur l'annee", imp, "kWh", 0, "#b91c1c"),
+                  ("Reseau, moyenne d'un mois", imp_moy, "kWh", 0, "#f97316"),
+                  ("Reseau, mois le plus mauvais", imp_pire, "kWh", 0, "#0f172a"),
+                  ("Production, moyenne d'un mois", prod_mens.mean(axis=1),
+                   "kWh", 0, "#d97706"),
+                  ("Autonomie sur l'annee", aut, "%", 2, "#15803d"),
+                  ("Autonomie, moyenne des mois", aut_moy, "%", 2, "#0891b2"),
+                  ("Autonomie du mois le plus faible", aut_min, "%", 2, "#b91c1c"),
+                  ("Economie annuelle", eco, "EUR/an", 0, "#15803d"),
+                  ("Investissement", capex, "EUR", 0, "#0f172a"),
+                  ("Retour", retour, "ans", 1, BLEU)]
+        for ax in (ax1, ax2, ax3, ax4, ax4b):
+            c.hover(ax, x, series, xfmt=entete, titre="Comparaison des options",
+                    cumul=False)
+        c.draw()
 
     def run_budget(self):
         if not self.res:
