@@ -12,7 +12,7 @@ import numpy as np
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
 
-from .config import DATA_DIR
+from .config import DATA_DIR, PVGIS_DATABASES, couverture_base
 
 PVGIS_URL = "https://re.jrc.ec.europa.eu/api/v5_3/seriescalc"
 TZ_LOCAL = ZoneInfo("Europe/Paris")
@@ -31,10 +31,34 @@ def default_file() -> str:
 # --------------------------------------------------------------------------
 # Telechargement
 # --------------------------------------------------------------------------
+def verifier_annees(y0: int, y1: int, db: str) -> None:
+    """Refuse tot, avec une explication, une periode que PVGIS ne couvre pas."""
+    if y1 < y0:
+        raise ValueError(
+            f"La derniere annee ({y1}) est anterieure a la premiere ({y0}).")
+    a0, a1 = couverture_base(db)
+    if y0 >= a0 and y1 <= a1:
+        return
+    autres = "\n".join(
+        f"    - {n} : {d['annees'][0]} a {d['annees'][1]}  ({d['resume']})"
+        for n, d in PVGIS_DATABASES.items())
+    raise ValueError(
+        f"La base {db} ne couvre que les annees {a0} a {a1}, or vous avez "
+        f"demande {y0} a {y1}.\n\n"
+        f"PVGIS publie ses series avec un a deux ans de retard : les donnees "
+        f"satellite sont controlees et recalibrees avant diffusion, il n'existe "
+        f"donc pas encore d'annee plus recente.\n\n"
+        f"Periodes disponibles :\n{autres}\n\n"
+        f"Ce n'est pas genant pour un dimensionnement : ces annees reelles "
+        f"couvrent deja des hivers doux comme des hivers froids, ce qui est "
+        f"exactement ce qu'il faut pour tester une installation.")
+
+
 def download_pvgis(lat, lon, year_start, year_end, db="PVGIS-SARAH3",
                    progress=None, dest=None) -> str:
     """Telecharge annee par annee et ecrit un CSV compresse. Retourne le chemin."""
     os.makedirs(DATA_DIR, exist_ok=True)
+    verifier_annees(int(year_start), int(year_end), db)
     dest = dest or cache_path(lat, lon, year_start, year_end, db)
     rows = []
     years = list(range(int(year_start), int(year_end) + 1))

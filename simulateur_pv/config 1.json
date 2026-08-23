@@ -1,15 +1,16 @@
 {
   "site": {
     "nom": "Langoiran (Gironde)",
-    "latitude": 44.71,
-    "longitude": -0.39,
-    "albedo": 0.2,
+    "latitude": 44.7158,
+    "longitude": -0.4153,
+    "albedo": 0.05,
     "annee_debut": 2018,
     "annee_fin": 2023,
     "base_donnees": "PVGIS-SARAH3"
   },
   "module": {
     "gamma_pmax": -0.0035,
+    "beta_voc_pct_k": -0.27,
     "noct_u0": 25.0,
     "noct_u1": 6.8,
     "iam_b0": 0.05,
@@ -18,16 +19,20 @@
   "systeme": {
     "n_onduleurs": 1,
     "p_nom_kw": 20.0,
-    "pv_max_kwc_par_onduleur": 30.0,
-    "eff_pv_ac": 0.922,
-    "eff_pv_batt": 0.925,
-    "eff_batt_ac": 0.925,
-    "veille_w": 90.0,
-    "veille_nuit_w": 90.0,
-    "batt_kwh_nominal": 50.3,
-    "dod": 0.95,
+    "pv_max_kwc_par_onduleur": 32.0,
+    "eff_pv_ac": 0.95,
+    "eff_pv_batt": 0.95,
+    "eff_batt_ac": 0.945,
+    "veille_w": 80.0,
+    "veille_nuit_w": 80.0,
+    "vdc_max_v": 650.0,
+    "vmppt_min_v": 160.0,
+    "i_max_string_a": 36.0,
+    "n_mppt_par_onduleur": 2,
+    "batt_kwh_nominal": 90.0,
+    "dod": 0.9,
     "eff_charge": 0.985,
-    "eff_decharge": 0.985,
+    "eff_decharge": 0.97,
     "c_rate_charge": 0.5,
     "c_rate_decharge": 0.5,
     "soc_initial": 0.5,
@@ -35,7 +40,7 @@
     "injection_nulle": true,
     "recharge_reseau_hc": false,
     "soc_cible_hc": 0.4,
-    "hc_debut": 2,
+    "hc_debut": 22,
     "hc_fin": 6
   },
   "economie": {
@@ -43,31 +48,63 @@
     "abonnement_an": 280.0,
     "prix_kwh_revente": 0.0,
     "facture_actuelle_an": 6093.0,
-    "cout_bois_stere": 0.0,
-    "pci_bois_kwh_stere": 1500.0,
+    "cout_bois_stere": 25.0,
+    "pci_bois_kwh_stere": 1000.0,
     "inflation_energie": 0.04,
     "duree_analyse_ans": 25
   },
   "champs": [
     {
-      "nom": "Champ hiver (sol, 60 degres)",
+      "nom": "champ 1",
       "actif": true,
-      "n_panneaux": 30,
+      "n_panneaux": 11,
       "wc_panneau": 500,
-      "inclinaison": 60.0,
+      "inclinaison": 52.0,
       "azimut": 180.0,
       "surface_m2_panneau": 2.2,
-      "ombrage_pct": 0.0
+      "ombrage_pct": 0.0,
+      "voc_v": 49.5,
+      "isc_a": 13.9,
+      "n_serie": 11
     },
     {
-      "nom": "Champ toiture (30 degres)",
-      "actif": false,
-      "n_panneaux": 8,
+      "nom": "champ2",
+      "actif": true,
+      "n_panneaux": 11,
       "wc_panneau": 500,
-      "inclinaison": 30.0,
+      "inclinaison": 52.0,
       "azimut": 180.0,
       "surface_m2_panneau": 2.2,
-      "ombrage_pct": 0.0
+      "ombrage_pct": 0.0,
+      "voc_v": 49.5,
+      "isc_a": 13.9,
+      "n_serie": 11
+    },
+    {
+      "nom": "Champ 3",
+      "actif": true,
+      "n_panneaux": 11,
+      "wc_panneau": 500.0,
+      "inclinaison": 40.0,
+      "azimut": 180.0,
+      "surface_m2_panneau": 2.2,
+      "ombrage_pct": 0.0,
+      "voc_v": 49.5,
+      "isc_a": 13.9,
+      "n_serie": 11
+    },
+    {
+      "nom": "Champ 4",
+      "actif": true,
+      "n_panneaux": 11,
+      "wc_panneau": 500.0,
+      "inclinaison": 40.0,
+      "azimut": 180.0,
+      "surface_m2_panneau": 2.2,
+      "ombrage_pct": 0.0,
+      "voc_v": 49.5,
+      "isc_a": 13.9,
+      "n_serie": 11
     }
   ],
   "postes": [
@@ -86,16 +123,16 @@
       "actif": true,
       "params": {
         "besoin_th_kwh_an": 28240.0,
-        "t_base": 17.0,
+        "t_base": 16.0,
         "t_consigne": 19.5,
         "cop_a": 2.75,
         "cop_b": 0.093,
         "cop_max": 4.6,
         "p_pac_kw_th": 26.0,
         "declassement_froid": 0.28,
-        "part_bois": 0.2,
+        "part_bois": 0.1,
         "t_bois": 3.0,
-        "inertie_h": 6.0
+        "inertie_h": 10.0
       }
     },
     {
@@ -103,10 +140,10 @@
       "kind": "ecs",
       "actif": true,
       "params": {
-        "besoin_th_kwh_an": 3400,
-        "cop": 2.8,
+        "besoin_th_kwh_an": 3400.0,
+        "cop": 1.0,
         "profil": "solaire",
-        "majoration_hiver": 0.2
+        "majoration_hiver": 0.15
       }
     },
     {
@@ -160,23 +197,23 @@
       "kind": "piscine",
       "actif": true,
       "params": {
-        "p_pompe_w": 750,
+        "p_pompe_w": 1000.0,
         "heures_par_mois": [
-          2,
-          2,
-          3,
-          5,
-          8,
-          10,
-          12,
-          12,
-          8,
-          4,
-          2,
-          2
+          2.0,
+          2.0,
+          3.0,
+          5.0,
+          8.0,
+          10.0,
+          12.0,
+          12.0,
+          8.0,
+          4.0,
+          2.0,
+          2.0
         ],
         "profil": "solaire",
-        "pac_piscine_kwh_an": 0
+        "pac_piscine_kwh_an": 0.0
       }
     },
     {
@@ -192,13 +229,13 @@
       }
     },
     {
-      "nom": "Vehicule electrique (futur)",
+      "nom": "Vehicule electrique",
       "kind": "vehicule",
       "actif": true,
       "params": {
-        "km_an": 5000.0,
+        "km_an": 7000.0,
         "conso_kwh_100km": 15.0,
-        "profil": "solaire_large",
+        "profil": "soiree",
         "jours_par_semaine": 4.0
       }
     }
@@ -222,7 +259,7 @@
       "poste": "Onduleurs hybrides Deye",
       "auto": "onduleurs",
       "qte": 0,
-      "pu": 1900.0,
+      "pu": 2400.0,
       "unite": "u"
     },
     {
@@ -236,14 +273,14 @@
       "poste": "BMS 16S 200 A",
       "auto": "packs",
       "qte": 0,
-      "pu": 240.0,
+      "pu": 110.0,
       "unite": "u"
     },
     {
       "poste": "Coffrets, busbars, compression, fusibles classe T",
       "auto": "packs",
       "qte": 0,
-      "pu": 320.0,
+      "pu": 50.0,
       "unite": "u"
     },
     {
@@ -257,56 +294,28 @@
       "poste": "Cablage batterie 95 mm2 et cosses",
       "auto": "onduleurs",
       "qte": 0,
-      "pu": 320.0,
+      "pu": 50.0,
       "unite": "u"
     },
     {
       "poste": "Tableaux AC/DC, parafoudres, protections",
       "auto": "fixe",
       "qte": 1,
-      "pu": 2600.0,
+      "pu": 500.0,
       "unite": "lot"
     },
     {
       "poste": "Terrassement, tranchee, liaison, mise a la terre",
       "auto": "fixe",
       "qte": 1,
-      "pu": 1800.0,
+      "pu": 500.0,
       "unite": "lot"
     },
     {
       "poste": "Supervision et mesure par circuit",
       "auto": "fixe",
       "qte": 1,
-      "pu": 600.0,
-      "unite": "lot"
-    },
-    {
-      "poste": "Consuel, declaration prealable, convention Enedis",
-      "auto": "fixe",
-      "qte": 1,
-      "pu": 400.0,
-      "unite": "lot"
-    },
-    {
-      "poste": "Chauffe-eau thermodynamique 300 L",
-      "auto": "fixe",
-      "qte": 1,
-      "pu": 1900.0,
-      "unite": "u"
-    },
-    {
-      "poste": "Insert bois et conduit",
-      "auto": "fixe",
-      "qte": 1,
-      "pu": 4000.0,
-      "unite": "u"
-    },
-    {
-      "poste": "Isolation combles et etancheite a l'air",
-      "auto": "fixe",
-      "qte": 1,
-      "pu": 3000.0,
+      "pu": 50.0,
       "unite": "lot"
     }
   ],

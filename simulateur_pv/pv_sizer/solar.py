@@ -55,12 +55,26 @@ def extraterrestrial(times_utc: np.ndarray) -> np.ndarray:
 # --------------------------------------------------------------------------
 # Transposition Hay-Davies vers plan incline
 # --------------------------------------------------------------------------
-def poa_irradiance(gbh, gdh, sun_el, sun_az, tilt, surf_az, e0, albedo=0.20):
+#   Modeles de ciel diffus disponibles. Le diffus represente environ 40 % du
+#   rayonnement annuel sous nos latitudes, et la quasi-totalite par temps
+#   couvert : le choix du modele n'est pas anecdotique.
+MODELES_DIFFUS = ("reindl", "hay_davies", "isotrope")
+
+
+def poa_irradiance(gbh, gdh, sun_el, sun_az, tilt, surf_az, e0, albedo=0.20,
+                   modele="reindl"):
     """Composantes horizontales -> plan incline.
 
     gbh : rayonnement direct sur plan horizontal (W/m2)
     gdh : rayonnement diffus horizontal (W/m2)
     tilt, surf_az : inclinaison et azimut du plan (degres, azimut depuis le Nord)
+    modele : traitement du diffus du ciel, voir MODELES_DIFFUS
+
+    Le diffus est traite de facon anisotrope : une part suit le soleil
+    (aureole circumsolaire), le reste vient de la voute entiere. Par temps
+    gris l'indice d'anisotropie tombe a zero et tout le diffus devient
+    isotrope : un plan incline ne voit alors que (1+cos i)/2 de la voute,
+    ce qui penalise les fortes inclinaisons les jours couverts.
 
     Retourne (poa_total, poa_direct, aoi_deg)."""
     elr = np.deg2rad(np.maximum(sun_el, 0.0))
@@ -80,13 +94,28 @@ def poa_irradiance(gbh, gdh, sun_el, sun_az, tilt, surf_az, e0, albedo=0.20):
 
     poa_beam = dni * cos_aoi_pos
 
-    # Diffus anisotrope (Hay-Davies)
+    ghi = gbh + gdh
+
+    # ---- diffus du ciel ----
+    # ai : indice d'anisotropie, part du diffus concentree autour du soleil.
+    #      Proche de 1 par ciel bleu, tombe a 0 par temps couvert.
+    # iso : fraction de la voute celeste vue par le plan incline.
     ai = np.clip(np.where(day, dni / np.maximum(e0, 1.0), 0.0), 0.0, 1.0)
     rb = np.where(day, cos_aoi_pos / np.maximum(sin_el, 0.026), 0.0)
     iso = (1.0 + np.cos(tr)) / 2.0
-    poa_diff = gdh * (ai * rb + (1.0 - ai) * iso)
+    if modele == "isotrope":
+        poa_diff = gdh * iso
+    elif modele == "hay_davies":
+        poa_diff = gdh * (ai * rb + (1.0 - ai) * iso)
+    else:
+        # Reindl : Hay-Davies plus le terme de brillance d'horizon. Le bas du
+        # ciel est plus lumineux que le zenith ; un plan incline le voit mieux
+        # qu'un plan horizontal. Sans ce terme on sous-estime les plans tres
+        # inclines, justement ceux qui interessent une installation d'hiver.
+        f = np.sqrt(np.clip(gbh / np.maximum(ghi, 1e-9), 0.0, 1.0))
+        horizon = 1.0 + f * np.sin(tr / 2.0) ** 3
+        poa_diff = gdh * (ai * rb + (1.0 - ai) * iso * horizon)
 
-    ghi = gbh + gdh
     poa_gnd = albedo * ghi * (1.0 - np.cos(tr)) / 2.0
 
     poa = np.maximum(poa_beam + poa_diff + poa_gnd, 0.0)
@@ -115,7 +144,8 @@ def field_dc_power(meteo: dict, kwc: float, tilt: float, surf_az: float,
     Retourne (p_dc_kw, poa_wm2, diagnostics)."""
     poa, poa_beam, aoi = poa_irradiance(
         meteo["Gbh"], meteo["Gdh"], meteo["sun_el"], meteo["sun_az"],
-        tilt, surf_az, meteo["E0"], albedo)
+        tilt, surf_az, meteo["E0"], albedo,
+        module.get("modele_diffus", "reindl"))
 
     iam = iam_ashrae(aoi, module.get("iam_b0", 0.05))
     poa_eff = poa_beam * iam + (poa - poa_beam) * 0.96

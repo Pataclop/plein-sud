@@ -52,6 +52,99 @@ def surface_m2(cfg: dict) -> float:
 
 
 # --------------------------------------------------------------------------
+# Cablage : tensions et courants de grappe (string)
+# --------------------------------------------------------------------------
+T_FROID_C = -10.0     # temperature de dimensionnement de la tension a vide
+T_STC_C = 25.0        # temperature des conditions standard
+
+
+def string_diag(cfg: dict, champ: dict) -> dict:
+    """Tensions et courants d'un groupe de panneaux.
+
+    En serie les tensions s'additionnent, en parallele les courants. La
+    tension a vide monte quand il fait froid : c'est elle qui doit rester
+    sous la tension DC maximale de l'onduleur.
+    """
+    n_pan = max(int(champ.get("n_panneaux", 0)), 0)
+    n_ser = max(int(champ.get("n_serie", 0) or 0), 1)
+    voc = float(champ.get("voc_v", 0.0))
+    isc = float(champ.get("isc_a", 0.0))
+    beta = float(cfg["module"].get("beta_voc_pct_k", -0.27)) / 100.0
+
+    n_grappes = n_pan / n_ser if n_ser else 0.0
+    voc_stc = voc * n_ser
+    voc_froid = voc_stc * (1.0 + beta * (T_FROID_C - T_STC_C))
+    return {
+        "n_panneaux": n_pan,
+        "n_serie": n_ser,
+        "n_grappes": n_grappes,
+        "n_grappes_entier": int(n_grappes),
+        "grappe_incomplete": abs(n_grappes - round(n_grappes)) > 1e-9,
+        "voc_stc": voc_stc,
+        "voc_froid": voc_froid,
+        "isc_total": isc * n_grappes,
+        "isc_grappe": isc,
+        "kwc": n_pan * float(champ.get("wc_panneau", 0.0)) / 1000.0,
+    }
+
+
+def total_grappes(cfg: dict) -> float:
+    return sum(string_diag(cfg, c)["n_grappes"]
+               for c in cfg["champs"] if c.get("actif", True))
+
+
+def check_cablage(cfg: dict) -> list:
+    """Alertes de cablage DC, calculables sans simulation."""
+    a = []
+    s = cfg["systeme"]
+    vmax = float(s.get("vdc_max_v", 800.0))
+    vmin = float(s.get("vmppt_min_v", 160.0))
+    imax = float(s.get("i_max_string_a", 26.0))
+    n_mppt = max(int(s.get("n_mppt_par_onduleur", 2)) * int(s["n_onduleurs"]), 1)
+
+    for ch in cfg["champs"]:
+        if not ch.get("actif", True):
+            continue
+        d = string_diag(cfg, ch)
+        nom = ch["nom"]
+        if d["voc_froid"] > vmax:
+            a.append(("erreur",
+                      f"{nom} : {d['voc_froid']:.0f} V a vide par -10 C pour une "
+                      f"limite onduleur de {vmax:.0f} V. Destruction immediate au "
+                      f"premier matin de gel : reduisez a "
+                      f"{int(vmax / max(d['voc_froid'] / d['n_serie'], 1e-9))} panneaux "
+                      f"en serie au maximum."))
+        elif d["voc_froid"] > 0.95 * vmax:
+            a.append(("attention",
+                      f"{nom} : {d['voc_froid']:.0f} V a vide par -10 C, soit moins de "
+                      f"5 % de marge sous les {vmax:.0f} V de l'onduleur. Une vague de "
+                      f"froid plus severe suffit a depasser la limite."))
+        if 0 < d["voc_stc"] < vmin * 1.25:
+            a.append(("attention",
+                      f"{nom} : {d['voc_stc']:.0f} V a vide seulement, pour un MPPT qui "
+                      f"demarre a {vmin:.0f} V. La grappe ne produira rien le matin, le "
+                      f"soir ni par temps couvert : allongez-la."))
+        if d["grappe_incomplete"]:
+            a.append(("attention",
+                      f"{nom} : {d['n_panneaux']} panneaux ne se divisent pas en grappes "
+                      f"de {d['n_serie']}. La derniere grappe serait incomplete et "
+                      f"produirait une tension differente des autres."))
+        if d["isc_grappe"] > imax:
+            a.append(("erreur",
+                      f"{nom} : {d['isc_grappe']:.1f} A par grappe pour une entree MPPT "
+                      f"limitee a {imax:.1f} A. Le courant sera bride et la production "
+                      f"perdue."))
+
+    n_g = total_grappes(cfg)
+    if n_g > n_mppt * 2:
+        a.append(("info",
+                  f"{n_g:.0f} grappes pour {n_mppt} entrees MPPT disponibles : il faudra "
+                  f"en mettre plus de deux en parallele par entree, via un coffret de "
+                  f"raccordement avec fusibles."))
+    return a
+
+
+# --------------------------------------------------------------------------
 # Dispatch horaire onduleur + batterie
 # --------------------------------------------------------------------------
 def dispatch(pv_dc: np.ndarray, load_ac: np.ndarray, meteo: dict, sys: dict):
@@ -219,7 +312,8 @@ def simulate(cfg: dict, meteo: dict) -> dict:
     res = {
         "meteo": meteo, "mensuel": m, "journalier": jour,
         "pv_dc": pv_dc, "load": load, "detail_postes": detail,
-        "dispatch": d, "diag_champs": diag_champs, "infos_postes": infos,
+        "dispatch": d, "diag_champs": diag_champs, "par_champ": par_champ,
+        "infos_postes": infos,
         "kpi": {
             "kwc": kwc,
             "panneaux": total_panneaux(cfg),
@@ -343,7 +437,7 @@ def economics(cfg: dict, res: dict) -> dict:
 # Controles de coherence
 # --------------------------------------------------------------------------
 def check_config(cfg: dict, res: dict) -> list:
-    a = []
+    a = check_cablage(cfg)
     k, s = res["kpi"], cfg["systeme"]
     pv_par_ond = k["pv_par_onduleur_kwc"]
     lim = float(s.get("pv_max_kwc_par_onduleur", 15.6))
@@ -380,6 +474,328 @@ def check_config(cfg: dict, res: dict) -> list:
                       f"{info.get('th_appoint_kwh_an', 0):.0f} kWh repris par l'appoint "
                       f"electrique direct."))
     return a
+
+
+# --------------------------------------------------------------------------
+# Optimisation des orientations, groupe par groupe
+#
+#   Les groupes ne sont PAS independants : ce qui compte n'est pas la
+#   production de chacun mais la facon dont leur somme se superpose a la
+#   consommation, heure par heure, a travers la batterie. Optimiser chaque
+#   groupe isolement donnerait la meme reponse pour tous (l'optimum annuel).
+#   On fait donc une descente par coordonnees : on balaye la grille complete
+#   d'un groupe, les autres etant figes, on garde le meilleur, puis on passe
+#   au groupe suivant et on recommence. Le deuxieme groupe "voit" alors que
+#   midi est deja couvert et part naturellement vers le matin ou le soir.
+# --------------------------------------------------------------------------
+#   cle interne -> (libelle, sens, unite, facteur d'affichage, decimales)
+#   sens = +1 : on maximise ; -1 : on minimise
+ORIENT_OBJECTIFS = {
+    "autonomie": ("Autonomie annuelle", +1, "%", 100.0, 2),
+    "autonomie_hiver": ("Autonomie de novembre a fevrier", +1, "%", 100.0, 2),
+    "import": ("Energie soutiree au reseau", -1, "kWh/an", 1.0, 0),
+    "autoconso": ("Energie autoconsommee", +1, "kWh/an", 1.0, 0),
+    "production": ("Production annuelle brute", +1, "kWh/an", 1.0, 0),
+    "cout": ("Cout annuel d'energie", -1, "EUR/an", 1.0, 0),
+}
+
+#   niveaux = grilles successives (pas en inclinaison, pas en azimut).
+#   Le niveau 0 balaye toute la plage, les suivants resserrent autour du
+#   meilleur point trouve au niveau precedent.
+ORIENT_EFFORTS = {
+    "rapide": {"label": "Rapide - grille large, 1 passe",
+               "niveaux": [(15.0, 30.0)], "passes": 1},
+    "normal": {"label": "Normal - grille affinee, 2 passes",
+               "niveaux": [(15.0, 30.0), (5.0, 10.0)], "passes": 2},
+    "fin": {"label": "Fin - grille serree, 3 passes",
+            "niveaux": [(10.0, 20.0), (5.0, 10.0), (2.0, 5.0)], "passes": 3},
+}
+
+
+def _grille(v0, v1, pas):
+    """Valeurs regulierement espacees de v0 a v1 inclus."""
+    if pas <= 0 or v1 <= v0:
+        return [float(v0)]
+    n = int(round((v1 - v0) / pas))
+    return [float(v0 + i * pas) for i in range(n + 1)]
+
+
+def _grille_autour(centre, demi, pas, borne_min, borne_max):
+    """Grille resserree autour d'un point, bornee par la plage autorisee."""
+    v0 = max(borne_min, centre - demi)
+    v1 = min(borne_max, centre + demi)
+    vals = _grille(v0, v1, pas)
+    if centre not in vals:
+        vals.append(float(centre))
+    return sorted(set(round(v, 3) for v in vals))
+
+
+def _metriques_orientation(pv_dc, load, meteo, cfg):
+    """Indicateurs d'une combinaison d'orientations, sans les agregats lourds."""
+    d = dispatch(pv_dc, load, meteo, cfg["systeme"])
+    ny = meteo["n_years"]
+    besoin, imp = d["besoin_total"], d["import"]
+    hiver = (meteo["month"] >= 11) | (meteo["month"] <= 2)
+    b_hiv, i_hiv = float(besoin[hiver].sum()), float(imp[hiver].sum())
+    e = cfg["economie"]
+
+    bes = float(besoin.sum()) / ny
+    impa = float(imp.sum()) / ny
+    exp = float(d["export"].sum()) / ny
+    return {
+        "production": float(pv_dc.sum()) / ny,
+        "besoin": bes,
+        "import": impa,
+        "autoconso": bes - impa,
+        "autonomie": 1.0 - impa / max(bes, 1e-9),
+        "autonomie_hiver": 1.0 - i_hiv / max(b_hiv, 1e-9),
+        "ecrete": float(d["ecrete"].sum()) / ny,
+        "export": exp,
+        "cout": (impa * float(e["prix_kwh_achat"]) + float(e["abonnement_an"])
+                 - exp * float(e.get("prix_kwh_revente", 0.0))),
+        "cycles": float(d["decharge"].sum()) / ny / max(d["utile"], 1e-9),
+    }
+
+
+def estimer_evaluations(n_libres, effort="normal", inclinaison_min=0.0,
+                        inclinaison_max=90.0, azimut_min=90.0, azimut_max=270.0,
+                        methode="conjointe"):
+    """Majorant du nombre de simulations, pour annoncer une duree a l'avance."""
+    conf = ORIENT_EFFORTS[effort]
+    total = 0
+    for niv, (pas_t, pas_a) in enumerate(conf["niveaux"]):
+        if niv == 0:
+            nt = len(_grille(inclinaison_min, inclinaison_max, pas_t))
+            na = len(_grille(azimut_min, azimut_max, pas_a))
+        else:
+            pt, pa = conf["niveaux"][niv - 1]
+            nt = len(_grille(-pt, pt, pas_t))
+            na = len(_grille(-pa, pa, pas_a))
+        total += nt * na
+    passes = 1 if methode == "independante" else conf["passes"]
+    return total * max(n_libres, 1) * passes
+
+
+ORIENT_METHODES = {
+    "conjointe": "Conjointe - chaque groupe optimise face aux autres (recommande)",
+    "independante": "Independante - chaque groupe optimise seul",
+}
+
+
+def optimize_orientations(cfg, meteo, libres=None, objectif="autonomie",
+                          effort="normal", inclinaison_min=0.0,
+                          inclinaison_max=90.0, azimut_min=90.0,
+                          azimut_max=270.0, methode="conjointe", progress=None):
+    """Cherche la meilleure inclinaison et le meilleur azimut de chaque groupe.
+
+    Chaque groupe est libre de prendre une orientation differente des autres :
+    c'est justement la complementarite entre groupes qui fait gagner de
+    l'autonomie. Renvoie l'etat avant / apres, la trace de la recherche et,
+    pour chaque groupe, la carte du critere sur toute la plage exploree.
+    """
+    if objectif not in ORIENT_OBJECTIFS:
+        raise ValueError(f"Objectif inconnu : {objectif}")
+    _lab, sens, _u, _f, _d = ORIENT_OBJECTIFS[objectif]
+    conf = ORIENT_EFFORTS[effort]
+
+    actifs = [i for i, c in enumerate(cfg["champs"]) if c.get("actif", True)]
+    libres = list(actifs) if libres is None else [i for i in libres if i in actifs]
+    if not libres:
+        raise ValueError("Aucun groupe actif a optimiser : cochez au moins un "
+                         "groupe, et verifiez qu'il est actif dans l'onglet 2.")
+    fixes = [i for i in actifs if i not in libres]
+
+    # La consommation ne depend pas de l'orientation : une seule fois.
+    load, _detail, _infos = build_load(cfg, meteo)
+    albedo = float(cfg["site"].get("albedo", 0.20))
+    module = cfg["module"]
+
+    def kwc_de(i):
+        ch = cfg["champs"][i]
+        return float(ch["n_panneaux"]) * float(ch["wc_panneau"]) / 1000.0
+
+    def pv_de(i, inclinaison, azimut):
+        kwc = kwc_de(i)
+        if kwc <= 0:
+            return np.zeros(meteo["n"])
+        p, _poa, _d = field_dc_power(
+            meteo, kwc, float(inclinaison), float(azimut), module, albedo,
+            float(cfg["champs"][i].get("ombrage_pct", 0.0)))
+        return p
+
+    pv_fixe = np.zeros(meteo["n"])
+    for i in fixes:
+        pv_fixe += pv_de(i, cfg["champs"][i]["inclinaison"],
+                         cfg["champs"][i].get("azimut", 180.0))
+
+    total_estime = estimer_evaluations(len(libres), effort, inclinaison_min,
+                                       inclinaison_max, azimut_min, azimut_max)
+    cache, n_eval = {}, [0]
+
+    def evaluer(combo):
+        cle = tuple((round(t, 3), round(a, 3)) for t, a in combo)
+        if cle in cache:
+            return cache[cle]
+        pv = pv_fixe.copy()
+        for i, (t, a) in zip(libres, combo):
+            pv += pv_de(i, t, a)
+        m = _metriques_orientation(pv, load, meteo, cfg)
+        cache[cle] = m
+        n_eval[0] += 1
+        if progress and n_eval[0] % 4 == 0:
+            progress(min(int(100 * n_eval[0] / max(total_estime, 1)), 99),
+                     f"{n_eval[0]} orientations testees")
+        return m
+
+    def evaluer_seul(i, t, a):
+        """Le groupe i seul face a la consommation, les autres ignores."""
+        cle = (i, round(t, 3), round(a, 3))
+        if cle in cache_seul:
+            return cache_seul[cle]
+        m = _metriques_orientation(pv_de(i, t, a), load, meteo, cfg)
+        cache_seul[cle] = m
+        n_eval[0] += 1
+        if progress and n_eval[0] % 4 == 0:
+            progress(min(int(100 * n_eval[0] / max(total_estime, 1)), 99),
+                     f"{n_eval[0]} orientations testees")
+        return m
+
+    cache_seul = {}
+    combo = [(float(cfg["champs"][i]["inclinaison"]),
+              float(cfg["champs"][i].get("azimut", 180.0))) for i in libres]
+    depart = list(combo)
+    m_avant = evaluer(combo)
+
+    # On retient le meilleur point jamais evalue, pas seulement le point
+    # d'arrivee : la descente par coordonnees peut osciller sur une egalite.
+    best_combo, best_score = list(combo), sens * m_avant[objectif]
+
+    # Le plus gros groupe choisit en premier : il prend l'orientation la plus
+    # rentable, les petits viennent ensuite completer les heures decouvertes.
+    ordre = sorted(range(len(libres)), key=lambda k: -kwc_de(libres[k]))
+    grilles, historique = {}, []
+
+    if methode == "independante":
+        # Chaque groupe est optimise seul, sans voir les autres. Utile pour
+        # comparer, mais les groupes convergent alors presque toujours vers la
+        # meme orientation : rien ne les pousse a se repartir la journee.
+        for k in ordre:
+            centre = combo[k]
+            for niv, (pas_t, pas_a) in enumerate(conf["niveaux"]):
+                if niv == 0:
+                    tilts = _grille(inclinaison_min, inclinaison_max, pas_t)
+                    azs = _grille(azimut_min, azimut_max, pas_a)
+                else:
+                    pt, pa = conf["niveaux"][niv - 1]
+                    tilts = _grille_autour(centre[0], pt, pas_t,
+                                           inclinaison_min, inclinaison_max)
+                    azs = _grille_autour(centre[1], pa, pas_a,
+                                         azimut_min, azimut_max)
+                carte = np.full((len(tilts), len(azs)), np.nan)
+                local = None
+                for it, t in enumerate(tilts):
+                    for ia, a in enumerate(azs):
+                        m = evaluer_seul(libres[k], t, a)
+                        carte[it, ia] = m[objectif]
+                        s = sens * m[objectif]
+                        if local is None or s > local[0]:
+                            local = (s, t, a)
+                if niv == 0:
+                    grilles[libres[k]] = {"inclinaisons": tilts, "azimuts": azs,
+                                          "carte": carte}
+                centre = (local[1], local[2])
+            if centre != combo[k]:
+                historique.append({"passe": 1,
+                                   "champ": cfg["champs"][libres[k]]["nom"],
+                                   "de": combo[k], "vers": centre,
+                                   "score": local[0]})
+            combo[k] = centre
+        m_final = evaluer(combo)
+        best_combo = list(combo)
+        return _resultat_orientation(cfg, objectif, sens, effort, methode, libres,
+                                     fixes, depart, best_combo, m_avant, m_final,
+                                     grilles, historique, n_eval[0], kwc_de)
+
+    for passe in range(conf["passes"]):
+        bouge = False
+        for k in ordre:
+            centre = combo[k]
+            for niv, (pas_t, pas_a) in enumerate(conf["niveaux"]):
+                if niv == 0:
+                    tilts = _grille(inclinaison_min, inclinaison_max, pas_t)
+                    azs = _grille(azimut_min, azimut_max, pas_a)
+                else:
+                    pt, pa = conf["niveaux"][niv - 1]
+                    tilts = _grille_autour(centre[0], pt, pas_t,
+                                           inclinaison_min, inclinaison_max)
+                    azs = _grille_autour(centre[1], pa, pas_a,
+                                         azimut_min, azimut_max)
+                carte = np.full((len(tilts), len(azs)), np.nan)
+                local = None
+                for it, t in enumerate(tilts):
+                    for ia, a in enumerate(azs):
+                        essai = list(combo)
+                        essai[k] = (t, a)
+                        m = evaluer(essai)
+                        carte[it, ia] = m[objectif]
+                        s = sens * m[objectif]
+                        if local is None or s > local[0]:
+                            local = (s, t, a)
+                        if s > best_score:
+                            best_score, best_combo = s, list(essai)
+                if niv == 0:
+                    grilles[libres[k]] = {"inclinaisons": tilts, "azimuts": azs,
+                                          "carte": carte}
+                centre = (local[1], local[2])
+            if centre != combo[k]:
+                bouge = True
+                historique.append({
+                    "passe": passe + 1, "champ": cfg["champs"][libres[k]]["nom"],
+                    "de": combo[k], "vers": centre,
+                    "score": sens * local[0] if sens < 0 else local[0]})
+            combo[k] = centre
+        if not bouge:
+            break
+
+    m_apres = evaluer(best_combo)
+    return _resultat_orientation(cfg, objectif, sens, effort, methode, libres,
+                                 fixes, depart, best_combo, m_avant, m_apres,
+                                 grilles, historique, n_eval[0], kwc_de)
+
+
+def _resultat_orientation(cfg, objectif, sens, effort, methode, libres, fixes,
+                          depart, arrivee, m_avant, m_apres, grilles,
+                          historique, evaluations, kwc_de):
+    def decrire(valeurs):
+        return [{"index": i, "nom": cfg["champs"][i]["nom"], "kwc": kwc_de(i),
+                 "inclinaison": t, "azimut": a}
+                for i, (t, a) in zip(libres, valeurs)]
+
+    return {
+        "objectif": objectif,
+        "sens": sens,
+        "effort": effort,
+        "methode": methode,
+        "libres": libres,
+        "fixes": [{"index": i, "nom": cfg["champs"][i]["nom"], "kwc": kwc_de(i),
+                   "inclinaison": float(cfg["champs"][i]["inclinaison"]),
+                   "azimut": float(cfg["champs"][i].get("azimut", 180.0))}
+                  for i in fixes],
+        "avant": {"champs": decrire(depart), "metriques": m_avant},
+        "apres": {"champs": decrire(arrivee), "metriques": m_apres},
+        "grilles": grilles,
+        "historique": historique,
+        "evaluations": evaluations,
+    }
+
+
+def appliquer_orientations(cfg, resultat):
+    """Ecrit dans la configuration les orientations proposees."""
+    for c in resultat["apres"]["champs"]:
+        ch = cfg["champs"][c["index"]]
+        ch["inclinaison"] = round(float(c["inclinaison"]), 2)
+        ch["azimut"] = round(float(c["azimut"]), 2)
+    return cfg
 
 
 # --------------------------------------------------------------------------

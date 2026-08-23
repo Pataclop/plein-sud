@@ -3,14 +3,15 @@ from __future__ import annotations
 import os, sys, copy, csv, traceback
 import numpy as np
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint
 from PyQt6.QtGui import QAction, QKeySequence, QColor, QFont
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QLabel, QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox,
     QCheckBox, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
     QGroupBox, QSplitter, QListWidget, QListWidgetItem, QMessageBox,
-    QFileDialog, QProgressBar, QScrollArea, QTextEdit, QSizePolicy, QGridLayout)
+    QFileDialog, QProgressBar, QScrollArea, QTextEdit, QSizePolicy, QGridLayout,
+    QToolTip)
 
 import matplotlib
 matplotlib.use("QtAgg")
@@ -23,6 +24,14 @@ from . import simulation as S
 
 MOIS = S.MOIS
 BLEU = "#1f4e79"
+ROUGE = "#b91c1c"
+ORANGE = "#d97706"
+VERT = "#15803d"
+
+CH_COLS = C.CHAMPS_COLONNES
+CH_IDX = {k: i for i, (k, _lab, _tip) in enumerate(CH_COLS) if k}
+CH_INT = {"n_panneaux", "n_serie"}
+CH_TEXTE = {"nom"}
 
 
 # ==========================================================================
@@ -45,6 +54,8 @@ class MonthsEditor(QWidget):
             sp.setRange(mn, mx); sp.setSingleStep(step); sp.setDecimals(decimals)
             sp.setMinimumWidth(52); sp.setButtonSymbols(
                 QDoubleSpinBox.ButtonSymbols.NoButtons)
+            lab.setToolTip(f"Valeur du mois de {m}")
+            sp.setToolTip(f"Valeur du mois de {m}")
             lay.addWidget(lab, 0, i)
             lay.addWidget(sp, 1, i)
             self.spins.append(sp)
@@ -78,10 +89,17 @@ class SchemaForm(QWidget):
                 form = QFormLayout(box)
                 outer.addWidget(box)
             w = self._make(typ, mn, mx, extra)
+            lab = QLabel(label)
+            # pas de retour a la ligne : QFormLayout rogne les libelles
+            # multilignes au lieu d'agrandir la rangee
+            lab.setWordWrap(False)
             if tip:
+                # l'infobulle suit le libelle ET le champ : on survole ce qu'on veut
                 w.setToolTip(tip)
+                lab.setToolTip(tip)
+                lab.setText(label + " <span style='color:#94a3b8'>&#9432;</span>")
             self.widgets[key] = w
-            form.addRow(label, w)
+            form.addRow(lab, w)
         outer.addStretch(1)
 
     def _make(self, typ, mn, mx, extra):
@@ -99,6 +117,14 @@ class SchemaForm(QWidget):
             w = QCheckBox(); w.stateChanged.connect(self._changed)
         elif typ == "choice":
             w = QComboBox(); w.addItems([str(x) for x in extra])
+            for i, x in enumerate(extra):
+                detail = C.SHAPES_HELP.get(str(x))
+                if detail is None and str(x) in C.PVGIS_DATABASES:
+                    d = C.PVGIS_DATABASES[str(x)]
+                    detail = (f"{d['resume']}<br>Annees {d['annees'][0]} a "
+                              f"{d['annees'][1]}<br>{d['detail']}")
+                if detail:
+                    w.setItemData(i, detail, Qt.ItemDataRole.ToolTipRole)
             w.currentIndexChanged.connect(self._changed)
         elif typ == "months":
             w = MonthsEditor(float(mn), float(mx), float(extra))
@@ -150,13 +176,95 @@ class SchemaForm(QWidget):
 
 
 class MplCanvas(FigureCanvasQTAgg):
+    """Canevas matplotlib qui affiche les valeurs sous le curseur.
+
+    Chaque trace declare ses series via hover() ; au survol on cherche le
+    point d'abscisse le plus proche et on l'affiche dans une infobulle.
+    """
+
     def __init__(self, w=7, h=4):
         self.fig = Figure(figsize=(w, h), tight_layout=True)
         super().__init__(self.fig)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._hover = {}
+        self._hover2d = {}
+        self.setMouseTracking(True)
+        self.mpl_connect("motion_notify_event", self._on_move)
+        self.mpl_connect("figure_leave_event", lambda _e: QToolTip.hideText())
 
     def clear(self):
         self.fig.clear()
+        self._hover = {}
+        self._hover2d = {}
+
+    def hover(self, axes, x, series, xfmt=None, titre=""):
+        """Declare les valeurs lisibles au survol.
+
+        axes   : un axe matplotlib ou une liste d'axes superposes (twinx)
+        x      : abscisses des points, dans les unites de l'axe
+        series : liste de (libelle, valeurs, unite, decimales)
+        xfmt   : fonction indice -> texte, pour l'en-tete de l'infobulle
+        """
+        payload = (np.asarray(x, dtype=float), series, xfmt, titre)
+        for ax in (axes if isinstance(axes, (list, tuple)) else [axes]):
+            self._hover[ax] = payload
+
+    def hover2d(self, ax, x, y, z, libelles, titre=""):
+        """Survol d'une carte : libelles = (nom_x, nom_y, nom_z, unite, decimales)."""
+        self._hover2d[ax] = (np.asarray(x, dtype=float), np.asarray(y, dtype=float),
+                             np.asarray(z, dtype=float), libelles, titre)
+
+    def _afficher(self, ev, html):
+        r = self.devicePixelRatioF() or 1.0
+        pos = QPoint(int(ev.x / r) + 12, int(self.height() - ev.y / r) + 12)
+        QToolTip.showText(self.mapToGlobal(pos), html, self)
+
+    def _on_move(self, ev):
+        ax = ev.inaxes
+        carte = self._hover2d.get(ax)
+        if carte is not None and ev.xdata is not None and ev.ydata is not None:
+            x, y, z, (nx, ny, nz, unite, dec), titre = carte
+            if len(x) == 0 or len(y) == 0:
+                return
+            ia = int(np.argmin(np.abs(x - float(ev.xdata))))
+            it = int(np.argmin(np.abs(y - float(ev.ydata))))
+            v = z[it, ia]
+            if not np.isfinite(v):
+                QToolTip.hideText()
+                return
+            self._afficher(ev, (
+                f"<div style='white-space:nowrap'><b>{titre}</b>"
+                f"<table cellspacing='0' cellpadding='1'>"
+                f"<tr><td>{nx}&nbsp;&nbsp;</td><td align='right'><b>{x[ia]:g}</b></td></tr>"
+                f"<tr><td>{ny}&nbsp;&nbsp;</td><td align='right'><b>{y[it]:g}</b></td></tr>"
+                f"<tr><td>{nz}&nbsp;&nbsp;</td><td align='right'>"
+                f"<b>{v:,.{dec}f}</b>&nbsp;{unite}</td></tr>"
+                f"</table></div>").replace(",", " "))
+            return
+        payload = self._hover.get(ax)
+        if payload is None or ev.xdata is None:
+            QToolTip.hideText()
+            return
+        x, series, xfmt, titre = payload
+        if len(x) == 0:
+            return
+        i = int(np.argmin(np.abs(x - float(ev.xdata))))
+        entete = xfmt(i) if callable(xfmt) else f"{x[i]:g}"
+        rangs = []
+        for lab, vals, unite, dec in series:
+            if i >= len(vals):
+                continue
+            v = f"{float(vals[i]):,.{dec}f}".replace(",", " ")
+            rangs.append(f"<tr><td>{lab}&nbsp;&nbsp;</td>"
+                         f"<td align='right'><b>{v}</b>&nbsp;{unite}</td></tr>")
+        if not rangs:
+            return
+        # ev.x/ev.y sont en pixels physiques depuis le bas ; Qt attend des
+        # pixels logiques depuis le haut (gere dans _afficher).
+        self._afficher(ev, f"<div style='white-space:nowrap'>"
+                           f"<b>{(titre + ' &mdash; ') if titre else ''}{entete}</b>"
+                           f"<table cellspacing='0' cellpadding='1'>"
+                           f"{''.join(rangs)}</table></div>")
 
 
 class Worker(QThread):
@@ -176,18 +284,31 @@ class Worker(QThread):
             self.failed.emit(traceback.format_exc())
 
 
-def table(headers, editable_cols=None, rows=0):
+def table(headers, tips=None, rows=0, stretch=True):
     t = QTableWidget(rows, len(headers))
     t.setHorizontalHeaderLabels(headers)
     t.verticalHeader().setVisible(False)
-    t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-    t.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+    hh = t.horizontalHeader()
+    if stretch:
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+    else:
+        hh.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+    for i, tip in enumerate(tips or []):
+        it = t.horizontalHeaderItem(i)
+        if it is not None and tip:
+            it.setToolTip(tip)
     t.setAlternatingRowColors(True)
     return t
 
 
-def item(text, editable=False, align_right=False, bold=False):
+def item(text, editable=False, align_right=False, bold=False, tip=None,
+         couleur=None):
     it = QTableWidgetItem(str(text))
+    if tip:
+        it.setToolTip(tip)
+    if couleur:
+        it.setForeground(QColor(couleur))
     fl = it.flags()
     if not editable:
         fl &= ~Qt.ItemFlag.ItemIsEditable
@@ -212,32 +333,70 @@ class PostesTab(QWidget):
         lay.addWidget(split)
 
         left = QWidget(); ll = QVBoxLayout(left)
-        ll.addWidget(QLabel("<b>Postes de consommation</b>"))
+        titre = QLabel("<b>Postes de consommation</b>")
+        titre.setToolTip(
+            "<b>Decrivez ce que la maison consomme, poste par poste.</b><br>"
+            "Chaque poste est converti en une courbe horaire sur toute la serie "
+            "meteo : c'est la superposition de ces courbes et de la production "
+            "solaire qui donne le taux d'autonomie.<br>"
+            "Selectionnez un poste pour en editer les parametres a droite.")
+        ll.addWidget(titre)
         self.list = QListWidget()
+        self.list.setToolTip(
+            "Liste des postes. Les postes desactives apparaissent en gris avec "
+            "la mention [off] et ne sont pas comptes.")
         self.list.currentRowChanged.connect(self.select)
         ll.addWidget(self.list)
 
         row = QHBoxLayout()
         self.combo_kind = QComboBox()
+        self.combo_kind.setToolTip(
+            "<b>Type du poste a creer.</b><br>"
+            "Le type determine le modele de calcul et donc les parametres "
+            "demandes. Survolez chaque entree de la liste pour le detail.")
         for k, v in C.LOAD_KINDS.items():
             self.combo_kind.addItem(v["label"], k)
+            self.combo_kind.setItemData(
+                self.combo_kind.count() - 1,
+                f"<b>{v['label']}</b><br>{v['help']}",
+                Qt.ItemDataRole.ToolTipRole)
         row.addWidget(self.combo_kind)
-        b_add = QPushButton("Ajouter"); b_add.clicked.connect(self.add)
-        b_del = QPushButton("Supprimer"); b_del.clicked.connect(self.remove)
+        b_add = QPushButton("Ajouter")
+        b_add.setToolTip("Cree un poste du type choisi a gauche, avec des "
+                         "valeurs par defaut a ajuster ensuite.")
+        b_add.clicked.connect(self.add)
+        b_del = QPushButton("Supprimer")
+        b_del.setToolTip("Supprime definitivement le poste selectionne. Pour "
+                         "le neutraliser sans le perdre, decochez plutot "
+                         "\"Poste actif\".")
+        b_del.clicked.connect(self.remove)
         row.addWidget(b_add); row.addWidget(b_del)
         ll.addLayout(row)
         self.lbl_total = QLabel("")
         self.lbl_total.setWordWrap(True)
+        self.lbl_total.setToolTip(
+            "Consommation annuelle simulee de chaque poste actif, apres "
+            "application des COP, des profils horaires et de la meteo reelle. "
+            "Mise a jour a chaque simulation (F5).")
         ll.addWidget(self.lbl_total)
         split.addWidget(left)
 
         right = QWidget(); self.rl = QVBoxLayout(right)
         head = QHBoxLayout()
         self.chk_actif = QCheckBox("Poste actif")
+        self.chk_actif.setToolTip(
+            "Decochez pour retirer ce poste du calcul sans perdre sa "
+            "configuration. Pratique pour chiffrer un usage futur "
+            "(vehicule electrique, jacuzzi) separement.")
         self.chk_actif.stateChanged.connect(self.commit)
         self.edit_nom = QLineEdit()
+        self.edit_nom.setToolTip(
+            "Nom libre du poste, utilise dans les tableaux de resultats.")
         self.edit_nom.editingFinished.connect(self.commit)
-        head.addWidget(QLabel("Nom :")); head.addWidget(self.edit_nom, 1)
+        lab_nom = QLabel("Nom :")
+        lab_nom.setToolTip("Nom libre du poste, utilise dans les tableaux "
+                           "de resultats.")
+        head.addWidget(lab_nom); head.addWidget(self.edit_nom, 1)
         head.addWidget(self.chk_actif)
         self.rl.addLayout(head)
         self.lbl_help = QLabel(""); self.lbl_help.setWordWrap(True)
@@ -345,8 +504,11 @@ class MainWindow(QMainWindow):
         self.meteo = None
         self.res = None
         self.worker = None
+        self._orient_libres = {}     # index de champ -> autorise a bouger
+        self._orient_res = None
 
         self.tabs = QTabWidget()
+        self.tabs.currentChanged.connect(self._tab_changed)
         self.setCentralWidget(self.tabs)
         self._build_site()
         self._build_champs()
@@ -356,6 +518,7 @@ class MainWindow(QMainWindow):
         self._build_couts()
         self._build_resultats()
         self._build_optim()
+        self._build_orientations()
         self._build_toolbar()
 
         self.progress = QProgressBar()
@@ -373,20 +536,32 @@ class MainWindow(QMainWindow):
     def _build_toolbar(self):
         tb = self.addToolBar("Actions")
         tb.setMovable(False)
-        for txt, slot, sc in [
-                ("Nouveau", self.new_config, None),
-                ("Ouvrir...", self.open_config, QKeySequence.StandardKey.Open),
-                ("Enregistrer...", self.save_config, QKeySequence.StandardKey.Save),
-                (None, None, None),
-                ("SIMULER  (F5)", self.run_sim, "F5"),
-                (None, None, None),
-                ("Exporter CSV...", self.export_csv, None)]:
+        for txt, slot, sc, tip in [
+                ("Nouveau", self.new_config, None,
+                 "Repart de la configuration par defaut. Les modifications "
+                 "non enregistrees seront perdues."),
+                ("Ouvrir...", self.open_config, QKeySequence.StandardKey.Open,
+                 "Charge une configuration enregistree au format JSON."),
+                ("Enregistrer...", self.save_config, QKeySequence.StandardKey.Save,
+                 "Enregistre toute la configuration (site, champs, postes, "
+                 "systeme, couts) dans un fichier JSON reutilisable."),
+                (None, None, None, None),
+                ("SIMULER  (F5)", self.run_sim, "F5",
+                 "Relance le calcul complet sur toute la serie meteo. "
+                 "A faire apres chaque modification."),
+                (None, None, None, None),
+                ("Exporter CSV...", self.export_csv, None,
+                 "Exporte le bilan mensuel, les indicateurs et le detail "
+                 "journalier dans un fichier CSV lisible par un tableur.")]:
             if txt is None:
                 tb.addSeparator(); continue
             a = QAction(txt, self)
             a.triggered.connect(slot)
             if sc:
                 a.setShortcut(sc)
+            if tip:
+                a.setToolTip(tip)
+                a.setStatusTip(tip)
             tb.addAction(a)
 
     # ---------------- onglet 1 : site ----------------
@@ -395,16 +570,31 @@ class MainWindow(QMainWindow):
         left = QWidget(); ll = QVBoxLayout(left)
         self.form_site = SchemaForm(
             [("__grp", "Implantation", None, None, None, None, "")] + C.SITE_SCHEMA,
-            on_change=self.mark_dirty)
+            on_change=self._site_changed)
         ll.addWidget(self.form_site)
+
+        self.lbl_annees = QLabel("")
+        self.lbl_annees.setWordWrap(True)
+        self.lbl_annees.setStyleSheet(
+            "background:#f1f5f9;padding:6px;border-radius:4px;")
+        ll.addWidget(self.lbl_annees)
+
         self.form_module = SchemaForm(
             [("__grp", "Modules et pertes", None, None, None, None, "")] + C.MODULE_SCHEMA,
             on_change=self.mark_dirty)
         ll.addWidget(self.form_module)
         row = QHBoxLayout()
         b1 = QPushButton("Charger la meteo en cache")
+        b1.setToolTip("Relit la serie meteo deja telechargee pour ce site, sans "
+                      "acces internet. C'est instantane.")
         b1.clicked.connect(lambda: self.load_meteo())
         b2 = QPushButton("Telecharger depuis PVGIS")
+        b2.setToolTip(
+            "Recupere sur les serveurs de la Commission europeenne les series "
+            "horaires reelles du site, pour la periode et la base choisies "
+            "ci-dessus.<br>Une seule fois par site : les composantes sont "
+            "stockees a l'horizontale, donc toutes les inclinaisons sont "
+            "ensuite calculables hors ligne.")
         b2.clicked.connect(self.download_meteo)
         row.addWidget(b1); row.addWidget(b2)
         ll.addLayout(row)
@@ -414,31 +604,119 @@ class MainWindow(QMainWindow):
         right = QWidget(); rl = QVBoxLayout(right)
         self.txt_meteo = QTextEdit(); self.txt_meteo.setReadOnly(True)
         self.txt_meteo.setMaximumHeight(190)
+        self.txt_meteo.setToolTip(
+            "Resume de la serie meteo actuellement chargee : c'est elle qui "
+            "sera rejouee heure par heure par la simulation.")
         rl.addWidget(self.txt_meteo)
         self.cv_meteo = MplCanvas(7, 4)
+        self.cv_meteo.setToolTip(
+            "Survolez un mois pour lire le rayonnement et la temperature.")
         rl.addWidget(self.cv_meteo, 1)
         lay.addWidget(right, 1)
         self.tabs.addTab(w, "1. Site et meteo")
 
+    def _site_changed(self, *_):
+        self.update_aide_annees()
+        self.mark_dirty()
+
+    def update_aide_annees(self):
+        """Explique, sous le formulaire, ce que couvre la base choisie."""
+        s = self.form_site.get()
+        db = s.get("base_donnees", "PVGIS-SARAH3")
+        info = C.PVGIS_DATABASES.get(db, {})
+        a0, a1 = C.couverture_base(db)
+        y0, y1 = int(s.get("annee_debut", a0)), int(s.get("annee_fin", a1))
+        detail = info.get("detail", "")
+        resume = info.get("resume", "")
+
+        if y1 < y0:
+            msg = (f"<span style='color:{ROUGE}'><b>La derniere annee ({y1}) est "
+                   f"anterieure a la premiere ({y0}).</b></span>")
+        elif y0 < a0 or y1 > a1:
+            manquantes = [y for y in range(y0, y1 + 1) if y < a0 or y > a1]
+            msg = (f"<span style='color:{ROUGE}'><b>{db} ne couvre pas "
+                   f"{', '.join(str(y) for y in manquantes)}.</b></span><br>"
+                   f"Cette base va de <b>{a0} a {a1}</b>. PVGIS publie ses series "
+                   f"avec un a deux ans de retard : les mesures satellite doivent "
+                   f"etre controlees et recalibrees avant diffusion, une annee "
+                   f"plus recente n'existe donc pas encore. Le telechargement "
+                   f"sera refuse.")
+        else:
+            msg = (f"<span style='color:{VERT}'><b>Periode valide : {y0} a {y1}, "
+                   f"soit {y1 - y0 + 1} annees reelles rejouees.</b></span><br>"
+                   f"{db} couvre {a0} a {a1}.")
+        self.lbl_annees.setText(
+            f"<b>Meteo : {resume}.</b><br>{msg}")
+        self.lbl_annees.setToolTip(
+            f"<b>{db}</b><br>{detail}<br><br>"
+            f"La simulation ne fabrique pas d'annee moyenne : elle rejoue chaque "
+            f"heure de chaque annee de la periode, puis moyenne les resultats. "
+            f"Une periode de 3 a 6 ans melange hivers doux et hivers froids, "
+            f"ce qui est exactement ce qu'il faut pour dimensionner.")
+
     # ---------------- onglet 2 : champs PV ----------------
     def _build_champs(self):
         w = QWidget(); lay = QVBoxLayout(w)
-        lay.addWidget(QLabel(
-            "<b>Groupes de panneaux.</b> Un groupe = un ensemble de panneaux partageant "
-            "la meme inclinaison. Azimut 180 = plein sud. Les inclinaisons sont "
-            "transposees localement : aucun retelechargement n'est necessaire."))
-        self.tbl_champs = table(["Actif", "Nom du groupe", "Nb panneaux", "Wc/panneau",
-                                 "Inclinaison", "Azimut", "m2/panneau", "Ombrage %",
-                                 "kWc", "kWh/kWc/an", "kWh/an"])
+        intro = QLabel(
+            "<b>Groupes de panneaux.</b> Un groupe rassemble les panneaux qui "
+            "partagent la meme inclinaison, la meme orientation et le meme "
+            "ombrage. Azimut 180 = plein sud. Les inclinaisons sont transposees "
+            "localement : aucun retelechargement meteo n'est necessaire pour en "
+            "essayer une autre.<br>"
+            "<b>Grappe (string)</b> = panneaux cables en serie : les "
+            "<b>tensions s'additionnent</b>. Les grappes sont ensuite mises en "
+            "parallele : les <b>courants s'additionnent</b>. Les colonnes "
+            "grisees sont calculees. "
+            "<i>Survolez n'importe quel en-tete de colonne pour l'explication "
+            "detaillee.</i>")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        self.tbl_champs = table([c[1] for c in CH_COLS],
+                                tips=[c[2] for c in CH_COLS], stretch=False)
         self.tbl_champs.itemChanged.connect(self._champs_changed)
-        lay.addWidget(self.tbl_champs, 1)
+        self.tbl_champs.setToolTip(
+            "Double-cliquez une cellule blanche pour la modifier. "
+            "Les colonnes grisees sont calculees automatiquement.")
+        lay.addWidget(self.tbl_champs, 0)
+
         row = QHBoxLayout()
-        b1 = QPushButton("Ajouter un groupe"); b1.clicked.connect(self.add_champ)
-        b2 = QPushButton("Supprimer le groupe"); b2.clicked.connect(self.del_champ)
+        b1 = QPushButton("Ajouter un groupe")
+        b1.setToolTip("Cree un groupe de panneaux supplementaire, par exemple "
+                      "une seconde orientation ou un second pan de toiture.")
+        b1.clicked.connect(self.add_champ)
+        b2 = QPushButton("Supprimer le groupe")
+        b2.setToolTip("Supprime definitivement le groupe selectionne. Pour le "
+                      "neutraliser sans le perdre, decochez plutot la case Actif.")
+        b2.clicked.connect(self.del_champ)
+        b3 = QPushButton("Separer les grappes")
+        b3.setToolTip(
+            "<b>Eclate le groupe selectionne en un groupe par grappe.</b><br>"
+            "Tant que plusieurs grappes sont reunies dans un meme groupe, "
+            "elles partagent forcement la meme inclinaison et le meme azimut. "
+            "Une fois separees, l'onglet 8 peut donner a chacune sa propre "
+            "orientation.<br>"
+            "<i>Reversible : reglez le nombre de panneaux d'un groupe et "
+            "supprimez les autres pour les regrouper a nouveau.</i>")
+        b3.clicked.connect(self.eclater_champ)
         self.lbl_champs = QLabel("")
-        row.addWidget(b1); row.addWidget(b2); row.addStretch(1); row.addWidget(self.lbl_champs)
+        row.addWidget(b1); row.addWidget(b2); row.addWidget(b3)
+        row.addStretch(1); row.addWidget(self.lbl_champs)
         lay.addLayout(row)
+
+        self.lbl_cablage = QLabel("")
+        self.lbl_cablage.setWordWrap(True)
+        self.lbl_cablage.setStyleSheet(
+            "background:#f1f5f9;padding:6px;border-radius:4px;")
+        lay.addWidget(self.lbl_cablage)
+
         self.cv_champs = MplCanvas(9, 3.4)
+        self.cv_champs.setToolTip(
+            "<b>Production mensuelle de chaque groupe de panneaux.</b><br>"
+            "Survolez un mois pour lire les valeurs exactes.<br>"
+            "C'est ici que se voit l'interet d'une forte inclinaison : elle "
+            "aplatit la courbe et remonte decembre, le mois qui dimensionne "
+            "une installation autonome.")
         lay.addWidget(self.cv_champs, 1)
         self.tabs.addTab(w, "2. Champs PV")
 
@@ -446,28 +724,24 @@ class MainWindow(QMainWindow):
         if getattr(self, "_loading_champs", False):
             return
         r, c = it.row(), it.column()
-        if r >= len(self.cfg["champs"]):
+        if r >= len(self.cfg["champs"]) or c >= len(CH_COLS):
             return
         ch = self.cfg["champs"][r]
+        key = CH_COLS[c][0]
+        if key is None:
+            return
         try:
-            if c == 0:
+            if key == "actif":
                 ch["actif"] = it.checkState() == Qt.CheckState.Checked
-            elif c == 1:
-                ch["nom"] = it.text()
-            elif c == 2:
-                ch["n_panneaux"] = max(int(float(it.text().replace(" ", ""))), 0)
-            elif c == 3:
-                ch["wc_panneau"] = float(it.text().replace(" ", ""))
-            elif c == 4:
-                ch["inclinaison"] = float(it.text().replace(",", "."))
-            elif c == 5:
-                ch["azimut"] = float(it.text().replace(",", "."))
-            elif c == 6:
-                ch["surface_m2_panneau"] = float(it.text().replace(",", "."))
-            elif c == 7:
-                ch["ombrage_pct"] = float(it.text().replace(",", "."))
+            elif key in CH_TEXTE:
+                ch[key] = it.text()
+            else:
+                v = float(it.text().replace(",", ".").replace(" ", ""))
+                ch[key] = max(int(v), 0) if key in CH_INT else v
         except ValueError:
             pass
+        if key == "n_serie" and int(ch.get("n_serie", 0) or 0) < 1:
+            ch["n_serie"] = 1
         self.refresh_champs()
         self.mark_dirty()
 
@@ -475,40 +749,195 @@ class MainWindow(QMainWindow):
         self._loading_champs = True
         t = self.tbl_champs
         t.setRowCount(len(self.cfg["champs"]))
+        sysc = self.cfg["systeme"]
+        vmax = float(sysc.get("vdc_max_v", 800.0))
+        imax = float(sysc.get("i_max_string_a", 26.0))
+        gris = QColor("#f8fafc")
+
         for r, ch in enumerate(self.cfg["champs"]):
+            d = S.string_diag(self.cfg, ch)
+
             chk = QTableWidgetItem("")
             chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
             chk.setCheckState(Qt.CheckState.Checked if ch.get("actif", True)
                               else Qt.CheckState.Unchecked)
+            chk.setToolTip(CH_COLS[0][2])
             t.setItem(r, 0, chk)
-            for c, v in enumerate([ch["nom"], ch["n_panneaux"], ch["wc_panneau"],
-                                   ch["inclinaison"], ch.get("azimut", 180),
-                                   ch.get("surface_m2_panneau", 2.2),
-                                   ch.get("ombrage_pct", 0)], start=1):
-                t.setItem(r, c, item(v, editable=True, align_right=(c > 1)))
-            kwc = ch["n_panneaux"] * ch["wc_panneau"] / 1000.0
-            t.setItem(r, 8, item(f"{kwc:.2f}", align_right=True, bold=True))
-            d = (self.res or {}).get("diag_champs", {}).get(ch["nom"], {})
-            t.setItem(r, 9, item(f"{d.get('productible_kwh_kwc', 0):,.0f}".replace(",", " ")
-                                 if d else "-", align_right=True))
-            t.setItem(r, 10, item(f"{d.get('production_kwh_an', 0):,.0f}".replace(",", " ")
-                                  if d else "-", align_right=True))
+
+            for key in ("nom", "n_panneaux", "wc_panneau", "inclinaison", "azimut",
+                        "surface_m2_panneau", "ombrage_pct", "voc_v", "isc_a",
+                        "n_serie"):
+                v = ch.get(key, C.CHAMP_DEFAUT.get(key, 0))
+                t.setItem(r, CH_IDX[key],
+                          item(v, editable=True, align_right=(key != "nom"),
+                               tip=CH_COLS[CH_IDX[key]][2]))
+
+            def calc(col, texte, tip, couleur=None, bold=False):
+                it = item(texte, align_right=True, bold=bold, tip=tip,
+                          couleur=couleur)
+                it.setBackground(gris)
+                t.setItem(r, col, it)
+
+            c0 = CH_IDX["n_serie"] + 1
+            incomplete = d["grappe_incomplete"]
+            calc(c0, f"{d['n_grappes']:.2f}".rstrip("0").rstrip("."),
+                 (f"{d['n_panneaux']} panneaux / {d['n_serie']} en serie"
+                  + (" &mdash; <b>grappe incomplete</b> : le compte ne tombe pas juste"
+                     if incomplete else "")),
+                 couleur=ORANGE if incomplete else None)
+
+            calc(c0 + 1, f"{d['voc_stc']:.0f}",
+                 f"{d['n_serie']} x {float(ch.get('voc_v', 0)):.1f} V a 25 C")
+
+            marge = 100 * (1 - d["voc_froid"] / vmax) if vmax else 0
+            if d["voc_froid"] > vmax:
+                col, etat = ROUGE, ("<b>DEPASSE la limite de l'onduleur "
+                                    f"({vmax:.0f} V) : destruction du materiel.</b>")
+            elif marge < 5:
+                col, etat = ORANGE, f"Marge de seulement {marge:.1f} % sous {vmax:.0f} V."
+            else:
+                col, etat = VERT, f"Marge de {marge:.0f} % sous les {vmax:.0f} V admis."
+            calc(c0 + 2, f"{d['voc_froid']:.0f}",
+                 f"Tension a vide de la grappe par -10 C.<br>{etat}",
+                 couleur=col, bold=True)
+
+            i_col = ROUGE if d["isc_grappe"] > imax else None
+            calc(c0 + 3, f"{d['isc_total']:.1f}",
+                 (f"{d['n_grappes']:.2f} grappes x {float(ch.get('isc_a', 0)):.1f} A."
+                  f"<br>Par grappe : {d['isc_grappe']:.1f} A pour une entree MPPT "
+                  f"limitee a {imax:.0f} A."),
+                 couleur=i_col)
+
+            calc(c0 + 4, f"{d['kwc']:.2f}",
+                 f"{d['n_panneaux']} x {float(ch.get('wc_panneau', 0)):.0f} Wc",
+                 bold=True)
+
+            diag = (self.res or {}).get("diag_champs", {}).get(ch["nom"], {})
+            calc(c0 + 5,
+                 f"{diag.get('productible_kwh_kwc', 0):,.0f}".replace(",", " ")
+                 if diag else "-",
+                 CH_COLS[c0 + 5][2])
+            calc(c0 + 6,
+                 f"{diag.get('production_kwh_an', 0):,.0f}".replace(",", " ")
+                 if diag else "-",
+                 CH_COLS[c0 + 6][2])
+
         self._loading_champs = False
+        self._ajuster_hauteur(t)
+        if getattr(self, "tbl_orient", None) is not None:
+            self.refresh_orient()
+
         kwc = S.total_kwc(self.cfg)
-        n = int(self.cfg["systeme"]["n_onduleurs"])
-        lim = float(self.cfg["systeme"]["pv_max_kwc_par_onduleur"])
-        col = "#b91c1c" if kwc / max(n, 1) > lim else "#15803d"
+        n = int(sysc["n_onduleurs"])
+        lim = float(sysc["pv_max_kwc_par_onduleur"])
+        col = ROUGE if kwc / max(n, 1) > lim else VERT
         self.lbl_champs.setText(
             f"<b>{S.total_panneaux(self.cfg)} panneaux &bull; {kwc:.2f} kWc &bull; "
             f"{S.surface_m2(self.cfg):.0f} m2</b> &nbsp; "
             f"<span style='color:{col}'>{kwc / max(n, 1):.1f} kWc/onduleur "
             f"(limite {lim:.1f})</span>")
+        self.lbl_champs.setToolTip(
+            "Totaux des groupes actifs.<br>La comparaison kWc par onduleur "
+            "reprend la limite constructeur saisie dans l'onglet 4.")
+        self.show_cablage()
+        self.draw_champs()
+
+    def draw_champs(self):
+        """Production mensuelle de chaque groupe de panneaux."""
+        c = self.cv_champs; c.clear()
+        ax = c.fig.add_subplot(111)
+        par_champ = (self.res or {}).get("par_champ") or {}
+        if not par_champ:
+            ax.text(.5, .5, "Lancez une simulation (F5) pour voir la production "
+                            "mensuelle de chaque groupe.",
+                    ha="center", va="center", fontsize=9, color="#94a3b8")
+            ax.set_xticks([]); ax.set_yticks([])
+            c.draw()
+            return
+        met, x = self.meteo, np.arange(12)
+        ny = met["n_years"]
+        series, bas = [], np.zeros(12)
+        couleurs = ["#fbbf24", "#1f4e79", "#15803d", "#b91c1c", "#7c3aed", "#0891b2"]
+        for k, (nom, p) in enumerate(par_champ.items()):
+            mens = np.array([p[met["month"] == mo + 1].sum() / ny for mo in range(12)])
+            ax.bar(x, mens, .62, bottom=bas, label=nom,
+                   color=couleurs[k % len(couleurs)])
+            bas = bas + mens
+            series.append((nom, mens, "kWh", 0))
+        series.append(("<b>Total</b>", bas, "kWh", 0))
+        besoin = (self.res or {}).get("mensuel", {}).get("besoin")
+        if besoin is not None:
+            ax.plot(x, besoin, color="#0f172a", lw=1.8, marker="o", ms=3,
+                    label="Besoin de la maison")
+            series.append(("Besoin de la maison", besoin, "kWh", 0))
+        ax.set_xticks(x); ax.set_xticklabels(MOIS, fontsize=8)
+        ax.set_ylabel("kWh/mois")
+        ax.set_title("Production mensuelle par groupe, face au besoin", fontsize=9)
+        ax.legend(fontsize=7, frameon=False, ncol=2)
+        c.hover(ax, x, series, xfmt=lambda i: MOIS[i], titre="Production mensuelle")
+        c.draw()
+
+    @staticmethod
+    def _ajuster_hauteur(t, mini=90, maxi=330):
+        """Ajuste la hauteur d'un tableau a son contenu, pour laisser la place
+        au graphique en dessous."""
+        h = t.horizontalHeader().height() + 2 * t.frameWidth() + 4
+        for r in range(t.rowCount()):
+            h += t.rowHeight(r)
+        h += t.horizontalScrollBar().sizeHint().height()
+        t.setMaximumHeight(max(mini, min(h, maxi)))
+
+    def show_cablage(self):
+        """Synthese DC : grappes, tensions extremes, courants, entrees MPPT."""
+        sysc = self.cfg["systeme"]
+        vmax = float(sysc.get("vdc_max_v", 800.0))
+        vmin = float(sysc.get("vmppt_min_v", 160.0))
+        imax = float(sysc.get("i_max_string_a", 26.0))
+        n_mppt = int(sysc.get("n_mppt_par_onduleur", 2)) * int(sysc["n_onduleurs"])
+        actifs = [c for c in self.cfg["champs"] if c.get("actif", True)]
+        if not actifs:
+            self.lbl_cablage.setText("Aucun groupe actif.")
+            return
+        diags = [S.string_diag(self.cfg, c) for c in actifs]
+        n_g = sum(d["n_grappes"] for d in diags)
+        v_pire = max(d["voc_froid"] for d in diags)
+        i_pire = max(d["isc_grappe"] for d in diags)
+        beta = float(self.cfg["module"].get("beta_voc_pct_k", -0.27))
+
+        cv = ROUGE if v_pire > vmax else ORANGE if v_pire > .95 * vmax else VERT
+        ci = ROUGE if i_pire > imax else VERT
+        cg = ORANGE if n_g > n_mppt * 2 else VERT
+
+        alertes = S.check_cablage(self.cfg)
+        coul = {"erreur": ROUGE, "attention": ORANGE, "info": BLEU}
+        txt = "".join(f"<br><span style='color:{coul[t]}'>&bull; {m}</span>"
+                      for t, m in alertes)
+        if not txt:
+            txt = (f"<br><span style='color:{VERT}'>&bull; Cablage coherent avec "
+                   f"les limites declarees dans l'onglet 4.</span>")
+        self.lbl_cablage.setText(
+            f"<b>Synthese du cablage continu</b> &nbsp;&bull;&nbsp; "
+            f"<b>{n_g:.0f} grappes</b> pour "
+            f"<span style='color:{cg}'>{n_mppt} entrees MPPT</span> "
+            f"&nbsp;&bull;&nbsp; tension a vide la plus haute par -10 C : "
+            f"<span style='color:{cv}'><b>{v_pire:.0f} V</b> / {vmax:.0f} V admis</span> "
+            f"&nbsp;&bull;&nbsp; courant le plus fort par grappe : "
+            f"<span style='color:{ci}'><b>{i_pire:.1f} A</b> / {imax:.0f} A admis</span>"
+            f"{txt}")
+        self.lbl_cablage.setToolTip(
+            f"<b>Comment ces chiffres sont obtenus</b><br>"
+            f"Tension a vide a froid = Voc du panneau x nombre en serie x "
+            f"(1 + {beta:.2f} %/C x (-10 C - 25 C)), soit environ "
+            f"{abs(beta) * 35:.1f} % de plus qu'a 25 C.<br>"
+            f"Le MPPT demarre a {vmin:.0f} V : une grappe trop courte ne "
+            f"produit rien le matin ni par temps couvert.<br>"
+            f"Le courant par grappe est celui d'un seul panneau (Isc) : la mise "
+            f"en serie n'augmente pas le courant.")
 
     def add_champ(self):
-        self.cfg["champs"].append({"nom": f"Champ {len(self.cfg['champs']) + 1}",
-                                   "actif": True, "n_panneaux": 20, "wc_panneau": 500,
-                                   "inclinaison": 40.0, "azimut": 180.0,
-                                   "surface_m2_panneau": 2.2, "ombrage_pct": 0.0})
+        ch = copy.deepcopy(C.CHAMP_DEFAUT)
+        ch["nom"] = f"Champ {len(self.cfg['champs']) + 1}"
+        self.cfg["champs"].append(ch)
         self.refresh_champs(); self.mark_dirty()
 
     def del_champ(self):
@@ -516,6 +945,39 @@ class MainWindow(QMainWindow):
         if 0 <= r < len(self.cfg["champs"]):
             del self.cfg["champs"][r]
             self.refresh_champs(); self.mark_dirty()
+
+    def eclater_champ(self):
+        r = self.tbl_champs.currentRow()
+        if not (0 <= r < len(self.cfg["champs"])):
+            QMessageBox.information(self, "Separer les grappes",
+                                    "Selectionnez d'abord une ligne du tableau.")
+            return
+        ch = self.cfg["champs"][r]
+        morceaux = C.eclater_grappes(ch)
+        if len(morceaux) < 2:
+            QMessageBox.information(
+                self, "Separer les grappes",
+                f"\"{ch['nom']}\" ne contient qu'une seule grappe "
+                f"({ch['n_panneaux']} panneaux en serie) : il n'y a rien a "
+                f"separer.\n\nPour en faire plusieurs grappes, reduisez "
+                f"d'abord le nombre de panneaux en serie dans la colonne "
+                f"\"Pann./grappe\".")
+            return
+        rep = QMessageBox.question(
+            self, "Separer les grappes",
+            f"\"{ch['nom']}\" contient {len(morceaux)} grappes.\n\n"
+            f"Le groupe sera remplace par {len(morceaux)} groupes de "
+            f"{morceaux[0]['n_panneaux']} panneaux, chacun libre de recevoir "
+            f"sa propre inclinaison et son propre azimut dans l'onglet 8.\n\n"
+            f"Continuer ?")
+        if rep != QMessageBox.StandardButton.Yes:
+            return
+        self.cfg["champs"][r:r + 1] = morceaux
+        self.refresh_champs()
+        self.mark_dirty()
+        self.statusBar().showMessage(
+            f"{len(morceaux)} groupes crees : chacun peut maintenant recevoir "
+            f"son orientation propre (onglet 8).", 8000)
 
     # ---------------- onglet 4 : systeme ----------------
     def _build_systeme(self):
@@ -526,8 +988,18 @@ class MainWindow(QMainWindow):
         lay.addWidget(sc, 0)
         right = QWidget(); rl = QVBoxLayout(right)
         self.txt_sys = QTextEdit(); self.txt_sys.setReadOnly(True)
+        self.txt_sys.setToolTip(
+            "Synthese calculee du systeme apres simulation : capacite "
+            "reellement utile, energie transitant par la batterie, nombre de "
+            "cycles et duree de vie estimee.")
         rl.addWidget(self.txt_sys, 0)
         self.cv_soc = MplCanvas(7, 4)
+        self.cv_soc.setToolTip(
+            "<b>Etat de charge de la batterie sur toute la serie meteo.</b><br>"
+            "Survolez la courbe pour lire la date et le niveau exact.<br>"
+            "Les creux qui touchent le trait rouge sont les moments ou la "
+            "batterie a ete videe et ou le reseau a pris le relais : ce sont "
+            "eux qui determinent la capacite necessaire.")
         rl.addWidget(self.cv_soc, 1)
         lay.addWidget(right, 1)
         self.tabs.addTab(w, "4. Onduleurs et batterie")
@@ -539,13 +1011,35 @@ class MainWindow(QMainWindow):
             "<b>Nomenclature.</b> La colonne <i>Quantite auto</i> relie la ligne a la "
             "configuration : le nombre de panneaux, d'onduleurs, de cellules ou la "
             "capacite batterie se mettent a jour tout seuls."))
-        self.tbl_bom = table(["Poste", "Quantite auto", "Qte (si fixe)", "Unite",
-                              "Prix unitaire", "Quantite retenue", "Montant"])
+        self.tbl_bom = table(
+            ["Poste", "Quantite auto", "Qte (si fixe)", "Unite",
+             "Prix unitaire (EUR)", "Quantite retenue", "Montant (EUR)"],
+            tips=[
+                "<b>Libelle libre de la ligne de devis.</b>",
+                "<b>Relie la quantite a la configuration.</b><br>"
+                "Choisissez par exemple \"Nombre total de panneaux\" et la ligne "
+                "suivra automatiquement le tableau des champs PV.<br>"
+                "\"Quantite saisie manuellement\" fige la valeur de la colonne "
+                "suivante.",
+                "<b>Quantite fixe, utilisee uniquement si la colonne precedente "
+                "est sur \"saisie manuellement\".</b><br>"
+                "Laissee a 0, elle vaut 1.",
+                "<b>Unite affichee, purement indicative</b> (u, lot, kWc, m2...).",
+                "<b>Prix unitaire hors pose, en euros.</b><br>"
+                "TTC si vous raisonnez TTC : soyez simplement coherent sur "
+                "toutes les lignes.",
+                "<b>Quantite reellement retenue apres application de la regle "
+                "automatique.</b> Colonne calculee.",
+                "<b>Quantite retenue x prix unitaire.</b> Colonne calculee."])
         self.tbl_bom.itemChanged.connect(self._bom_changed)
         lay.addWidget(self.tbl_bom, 1)
         row = QHBoxLayout()
-        b1 = QPushButton("Ajouter une ligne"); b1.clicked.connect(self.add_bom)
-        b2 = QPushButton("Supprimer la ligne"); b2.clicked.connect(self.del_bom)
+        b1 = QPushButton("Ajouter une ligne")
+        b1.setToolTip("Ajoute une ligne vide a la nomenclature.")
+        b1.clicked.connect(self.add_bom)
+        b2 = QPushButton("Supprimer la ligne")
+        b2.setToolTip("Supprime la ligne selectionnee du devis.")
+        b2.clicked.connect(self.del_bom)
         row.addWidget(b1); row.addWidget(b2); row.addStretch(1)
         self.lbl_bom = QLabel(""); row.addWidget(self.lbl_bom)
         lay.addLayout(row)
@@ -629,21 +1123,74 @@ class MainWindow(QMainWindow):
         w = QWidget(); lay = QVBoxLayout(w)
         self.lbl_kpi = QLabel("Appuyez sur F5 pour lancer la simulation.")
         self.lbl_kpi.setWordWrap(True)
+        self.lbl_kpi.setToolTip(
+            "<b>Les six chiffres qui resument l'installation.</b><br><br>"
+            "<b>Autonomie annuelle</b> : part du besoin couverte sans le "
+            "reseau, soit 1 - import / besoin.<br>"
+            "<b>kWh soutires/an</b> : ce que vous achetez encore au reseau, "
+            "la base de votre facture.<br>"
+            "<b>kWh consommes/an</b> : besoin total, veille des onduleurs "
+            "comprise.<br>"
+            "<b>kWh produits/an</b> : production des panneaux, avant ecretage.<br>"
+            "<b>Investissement</b> : total de la nomenclature de l'onglet 5.<br>"
+            "<b>Retour</b> : nombre d'annees pour rembourser cet "
+            "investissement par les economies, face a votre facture actuelle "
+            "et avec l'inflation energie supposee.")
         self.lbl_kpi.setStyleSheet(
             f"background:{BLEU};color:white;padding:9px;border-radius:4px;")
         lay.addWidget(self.lbl_kpi)
         self.lbl_alertes = QLabel(""); self.lbl_alertes.setWordWrap(True)
+        self.lbl_alertes.setToolTip(
+            "<b>Controles de coherence automatiques.</b><br>"
+            "<span style='color:#b91c1c'>ERREUR</span> : la configuration "
+            "n'est pas realisable telle quelle, ou detruirait du materiel.<br>"
+            "<span style='color:#d97706'>ATTENTION</span> : realisable mais "
+            "sous-optimal ou sans marge.<br>"
+            "<span style='color:#1f4e79'>INFO</span> : simple remarque de "
+            "dimensionnement.")
         lay.addWidget(self.lbl_alertes)
 
         sub = QTabWidget()
         # mensuel
         w1 = QWidget(); l1 = QVBoxLayout(w1)
-        self.tbl_mois = table(["Mois", "Conso usages", "Veille", "Besoin total",
-                               "Production", "Autoconso", "Import reseau",
-                               "Ecrete/injecte", "Autonomie", "Conso/jour",
-                               "Prod/jour", "Budget conso/jour"])
+        self.tbl_mois = table(
+            ["Mois", "Conso usages (kWh)", "Veille (kWh)", "Besoin total (kWh)",
+             "Production (kWh)", "Autoconso (kWh)", "Import reseau (kWh)",
+             "Ecrete/injecte (kWh)", "Autonomie (%)", "Conso/jour (kWh)",
+             "Prod/jour (kWh)", "Budget conso/jour (kWh)"],
+            tips=[
+                "Mois de l'annee. La derniere ligne totalise l'annee.",
+                "<b>Energie appelee par vos usages sur le mois</b> (chauffage, "
+                "eau chaude, electromenager...), hors consommation propre des "
+                "onduleurs. Moyenne sur toutes les annees meteo.",
+                "<b>Consommation a vide des onduleurs sur le mois.</b><br>"
+                "Ils absorbent quelques dizaines de watts en permanence, "
+                "24 h/24, simplement pour rester allumes.",
+                "<b>Besoin total = usages + veille.</b><br>"
+                "C'est ce que l'installation doit couvrir.",
+                "<b>Energie produite par les panneaux sur le mois, cote continu.</b>",
+                "<b>Part de la production reellement consommee</b>, directement "
+                "ou via la batterie. C'est l'energie qui vous fait economiser.",
+                "<b>Energie achetee au reseau sur le mois.</b><br>"
+                "C'est ce poste, multiplie par le prix du kWh, qui constitue "
+                "votre facture.",
+                "<b>Production perdue ou revendue.</b><br>"
+                "Ecretee quand la batterie est pleine et la maison servie "
+                "(injection nulle), injectee si la revente est activee.",
+                "<b>Autonomie = 1 - import / besoin.</b><br>"
+                "Part du besoin couverte sans le reseau.<br>"
+                "Vert au-dela de 90 %, orange de 70 a 90 %, rouge en dessous.",
+                "<b>Consommation moyenne d'une journee de ce mois.</b>",
+                "<b>Production moyenne d'une journee de ce mois.</b>",
+                "<b>Consommation journaliere maximale compatible avec votre "
+                "objectif d'autonomie, a installation constante.</b><br>"
+                "Rempli par le bouton \"Budget de consommation\" de l'onglet 7. "
+                "Repond a la question : combien puis-je me permettre de "
+                "consommer en janvier ?"])
         l1.addWidget(self.tbl_mois)
         self.cv_mois = MplCanvas(9, 3.6)
+        self.cv_mois.setToolTip(
+            "Survolez un mois pour lire toutes ses valeurs : production, autoconsommation, soutirage, autonomie.")
         l1.addWidget(self.cv_mois, 1)
         sub.addTab(w1, "Bilan mensuel")
         # journalier
@@ -651,22 +1198,45 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.addWidget(QLabel("Mois :"))
         self.cb_mois = QComboBox(); self.cb_mois.addItems(MOIS)
+        self.cb_mois.setToolTip("Mois a detailler jour par jour.")
         self.cb_mois.currentIndexChanged.connect(self.draw_jour)
         row.addWidget(self.cb_mois)
         row.addWidget(QLabel("Annee :"))
         self.cb_annee = QComboBox()
+        self.cb_annee.setToolTip(
+            "<b>Annee reelle a afficher.</b><br>"
+            "La liste reprend les annees de la serie meteo telechargee. "
+            "Comparez un hiver doux et un hiver froid : c'est le pire cas qui "
+            "dimensionne l'installation.")
         self.cb_annee.currentIndexChanged.connect(self.draw_jour)
         row.addWidget(self.cb_annee); row.addStretch(1)
         l2.addLayout(row)
-        self.tbl_jour = table(["Date", "Production", "Consommation", "Besoin",
-                               "Import", "Autonomie", "SOC min"])
+        self.tbl_jour = table(
+            ["Date", "Production (kWh)", "Consommation (kWh)", "Besoin (kWh)",
+             "Import (kWh)", "Autonomie (%)", "Charge mini batterie (kWh)"],
+            tips=[
+                "Jour calendaire de la serie meteo rejouee.",
+                "Energie produite par les panneaux ce jour-la.",
+                "Energie appelee par vos usages, hors veille des onduleurs.",
+                "Besoin total de la journee, veille des onduleurs comprise.",
+                "Energie achetee au reseau ce jour-la.",
+                "Part du besoin de la journee couverte sans le reseau.",
+                "<b>Niveau le plus bas atteint par la batterie dans la "
+                "journee, en kWh.</b><br>"
+                "S'il touche le plancher, la batterie a ete videe : c'est la "
+                "que le reseau prend le relais. Un plancher atteint souvent en "
+                "hiver signale une batterie sous-dimensionnee."])
         l2.addWidget(self.tbl_jour, 1)
         self.cv_jour = MplCanvas(9, 3.2)
+        self.cv_jour.setToolTip(
+            "Survolez un jour pour lire production, besoin, soutirage, autonomie et niveau de batterie.")
         l2.addWidget(self.cv_jour, 1)
         sub.addTab(w2, "Detail journalier")
         # profil horaire
         w3 = QWidget(); l3 = QVBoxLayout(w3)
         self.cv_profil = MplCanvas(9, 5)
+        self.cv_profil.setToolTip(
+            "Journee moyenne de chaque mois, en kW. Survolez une heure pour lire les puissances exactes. L'ecart entre le jaune (production) et le bleu (besoin) montre a quelles heures il faut deplacer les usages.")
         l3.addWidget(NavigationToolbar2QT(self.cv_profil, self))
         l3.addWidget(self.cv_profil, 1)
         sub.addTab(w3, "Journee type par mois")
@@ -679,6 +1249,11 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.addWidget(QLabel("Parametre a balayer :"))
         self.cb_sweep = QComboBox()
+        self.cb_sweep.setToolTip(
+            "<b>Parametre a faire varier.</b><br>"
+            "Une simulation complete est relancee pour chacune des valeurs "
+            "saisies a droite, tout le reste de la configuration etant fige. "
+            "C'est la facon la plus sure de trouver un optimum.")
         self.cb_sweep.addItem("Inclinaison de tous les champs (deg)", "inclinaison")
         self.cb_sweep.addItem("Inclinaison du 1er champ (deg)", "inclinaison_champ1")
         self.cb_sweep.addItem("Puissance PV totale (kWc)", "kwc")
@@ -687,28 +1262,508 @@ class MainWindow(QMainWindow):
         row.addWidget(self.cb_sweep)
         row.addWidget(QLabel("Valeurs :"))
         self.ed_sweep = QLineEdit("20, 30, 40, 50, 60, 70, 80")
+        self.ed_sweep.setToolTip(
+            "<b>Valeurs a essayer, separees par des virgules.</b><br>"
+            "Dans l'unite du parametre choisi a gauche : des degres pour une "
+            "inclinaison, des kWc pour une puissance, des kWh pour une "
+            "batterie, un nombre entier pour les onduleurs.<br>"
+            "Exemple : 20, 30, 40, 50, 60, 70, 80")
         row.addWidget(self.ed_sweep, 1)
-        b = QPushButton("Lancer le balayage"); b.clicked.connect(self.run_sweep)
+        b = QPushButton("Lancer le balayage")
+        b.setToolTip("Relance une simulation complete pour chaque valeur de la "
+                     "liste. Comptez quelques secondes par valeur.")
+        b.clicked.connect(self.run_sweep)
         row.addWidget(b)
-        bb = QPushButton("Budget de consommation"); bb.clicked.connect(self.run_budget)
-        row.addWidget(bb)
+        bb = QPushButton("Budget de consommation")
+        bb.setToolTip(
+            "<b>Question inverse : a installation constante, combien puis-je "
+            "consommer par jour ?</b><br>"
+            "Cherche, mois par mois, la consommation journaliere maximale qui "
+            "respecte encore l'objectif d'autonomie. Le resultat remplit la "
+            "derniere colonne du bilan mensuel de l'onglet 6.")
+        bb.clicked.connect(self.run_budget)
         lay.addLayout(row)
-        self.tbl_sweep = table(["Valeur", "Autonomie", "Production", "Import reseau",
-                                "Ecrete", "Investissement", "Retour (ans)"])
+        self.tbl_sweep = table(
+            ["Valeur testee", "Autonomie (%)", "Production (kWh/an)",
+             "Import reseau (kWh/an)", "Ecrete (kWh/an)",
+             "Investissement (EUR)", "Retour (ans)"],
+            tips=[
+                "Valeur donnee au parametre balaye pour cette simulation. "
+                "La meilleure ligne est en gras.",
+                "Part du besoin annuel couverte sans le reseau.",
+                "Production annuelle moyenne des panneaux.",
+                "Energie achetee au reseau sur l'annee.",
+                "Production perdue faute de place dans la batterie et "
+                "d'usage immediat.",
+                "Cout total issu de la nomenclature de l'onglet 5, recalcule "
+                "pour chaque valeur testee.",
+                "Nombre d'annees pour rembourser l'investissement par les "
+                "economies, face a votre facture actuelle."])
         lay.addWidget(self.tbl_sweep, 1)
         self.cv_sweep = MplCanvas(9, 4)
+        self.cv_sweep.setToolTip(
+            "Survolez un point pour lire toutes les valeurs de la simulation correspondante.")
         lay.addWidget(self.cv_sweep, 1)
         self.tabs.addTab(w, "7. Optimisation")
+
+    # ---------------- onglet 8 : orientation des champs ----------------
+    def _build_orientations(self):
+        w = QWidget(); lay = QVBoxLayout(w)
+        intro = QLabel(
+            "<b>Quelle orientation donner a chaque groupe ?</b> Chaque groupe "
+            "peut recevoir une inclinaison et un azimut differents des autres : "
+            "c'est souvent ce qui rapporte le plus.<br>"
+            "<b>Pourquoi ne pas optimiser chaque groupe separement ?</b> Parce "
+            "que les groupes ne sont pas independants. Ce qui compte n'est pas "
+            "la production de chacun, mais la facon dont leur <i>somme</i> se "
+            "superpose a votre consommation, heure par heure, a travers la "
+            "batterie. Optimises isolement, ils donneraient tous la meme "
+            "reponse. Le calcul balaye donc la grille complete d'un groupe, "
+            "les autres etant figes, garde le meilleur, passe au suivant, et "
+            "recommence : le deuxieme groupe \"voit\" que midi est deja "
+            "couvert et part de lui-meme vers le matin ou le soir.<br>"
+            "<i>Un groupe = une orientation. Pour orienter vos grappes une par "
+            "une, utilisez d'abord \"Separer les grappes\" dans l'onglet 2.</i>")
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        row = QHBoxLayout()
+        lab_obj = QLabel("Critere a optimiser :")
+        lab_obj.setToolTip("Ce que le calcul cherche a ameliorer.")
+        row.addWidget(lab_obj)
+        self.cb_obj = QComboBox()
+        aides_obj = {
+            "autonomie": "Part du besoin annuel couverte sans le reseau. Le "
+                         "critere par defaut d'une installation autonome.",
+            "autonomie_hiver": "Autonomie sur novembre a fevrier seulement. "
+                               "C'est l'hiver qui dimensionne une installation "
+                               "autonome : ce critere pousse vers de fortes "
+                               "inclinaisons, au prix de l'ete.",
+            "import": "Kilowattheures achetes au reseau sur l'annee. Tres "
+                      "proche de l'autonomie, mais exprime en energie.",
+            "autoconso": "Energie produite ET reellement consommee. Favorise "
+                         "l'etalement de la production sur la journee.",
+            "production": "Production brute, sans tenir compte de vos usages. "
+                          "Donne l'orientation classique plein sud vers 35 "
+                          "degres, et fera donc converger tous les groupes vers "
+                          "la meme valeur : utile comme point de comparaison.",
+            "cout": "Facture annuelle d'energie : soutirage x prix du kWh, plus "
+                    "l'abonnement, moins la revente eventuelle.",
+        }
+        for cle, (libelle, sens, unite, _f, _d) in S.ORIENT_OBJECTIFS.items():
+            fleche = "maximiser" if sens > 0 else "minimiser"
+            self.cb_obj.addItem(f"{libelle} ({fleche})", cle)
+            self.cb_obj.setItemData(self.cb_obj.count() - 1,
+                                    f"<b>{libelle}</b> &mdash; a {fleche}.<br>"
+                                    f"{aides_obj.get(cle, '')}",
+                                    Qt.ItemDataRole.ToolTipRole)
+        self.cb_obj.setToolTip(
+            "<b>Le critere change completement la reponse.</b><br>"
+            "\"Production annuelle\" donne le classique plein sud a 35 degres "
+            "pour tout le monde. \"Autonomie\" tient compte de vos usages et "
+            "de la batterie, et c'est la que des orientations differentes "
+            "deviennent interessantes.")
+        row.addWidget(self.cb_obj, 1)
+
+        lab_eff = QLabel("Finesse :")
+        row.addWidget(lab_eff)
+        self.cb_effort = QComboBox()
+        for cle, d in S.ORIENT_EFFORTS.items():
+            self.cb_effort.addItem(d["label"], cle)
+        self.cb_effort.setCurrentIndex(1)
+        self.cb_effort.setToolTip(
+            "<b>Compromis entre precision et duree.</b><br>"
+            "&bull; <b>Rapide</b> : pas de 15 degres en inclinaison et 30 en "
+            "azimut, une seule passe.<br>"
+            "&bull; <b>Normal</b> : la grille large est ensuite resserree "
+            "autour du meilleur point, deux passes. Recommande.<br>"
+            "&bull; <b>Fin</b> : grille serree, trois passes. Nettement plus "
+            "long, pour un gain souvent inferieur a 0,1 point.")
+        row.addWidget(self.cb_effort, 1)
+        lay.addLayout(row)
+
+        row_m = QHBoxLayout()
+        lab_met = QLabel("Methode :")
+        row_m.addWidget(lab_met)
+        self.cb_methode = QComboBox()
+        for cle, libelle in S.ORIENT_METHODES.items():
+            self.cb_methode.addItem(libelle, cle)
+        aide_met = (
+            "<b>Conjointe</b> &mdash; on balaye la grille complete d'un groupe, "
+            "les autres restant a leur orientation du moment, on garde le "
+            "meilleur, puis on passe au groupe suivant et on recommence "
+            "jusqu'a stabilisation.<br>"
+            "Chaque groupe obtient bien sa propre inclinaison et son propre "
+            "azimut, mais en tenant compte de ce que les autres produisent "
+            "deja. C'est ce qui fait emerger les orientations complementaires "
+            "est/ouest quand elles sont payantes.<br><br>"
+            "<b>Independante</b> &mdash; chaque groupe est optimise seul face a "
+            "la consommation, comme s'il etait le seul installe.<br>"
+            "<i>Attention : dans ce mode les groupes n'ont aucune raison de se "
+            "repartir la journee, et ils renvoient presque toujours la meme "
+            "orientation. Utile pour connaitre l'optimum d'un groupe pris "
+            "isolement, ou comme point de comparaison, mais le total obtenu "
+            "est en general moins bon qu'en conjointe.</i>")
+        self.cb_methode.setToolTip(aide_met)
+        for i in range(self.cb_methode.count()):
+            self.cb_methode.setItemData(i, aide_met, Qt.ItemDataRole.ToolTipRole)
+        row_m.addWidget(self.cb_methode, 1)
+        row_m.addStretch(0)
+        lay.addLayout(row_m)
+
+        row2 = QHBoxLayout()
+        lab_pl = QLabel("Plages autorisees \u2014 inclinaison de")
+        lab_pl.setToolTip(
+            "<b>Bornes de la recherche.</b><br>"
+            "Restreignez-les si votre support impose une contrainte : une "
+            "toiture existante fixe l'inclinaison, un mur impose 90 degres, "
+            "un chassis reglable ne descend pas sous 15 degres.")
+        row2.addWidget(lab_pl)
+        self.sp_inc_min = QDoubleSpinBox(); self.sp_inc_min.setRange(0, 90)
+        self.sp_inc_min.setValue(0); self.sp_inc_min.setSuffix(" deg")
+        self.sp_inc_max = QDoubleSpinBox(); self.sp_inc_max.setRange(0, 90)
+        self.sp_inc_max.setValue(90); self.sp_inc_max.setSuffix(" deg")
+        row2.addWidget(self.sp_inc_min); row2.addWidget(QLabel("a"))
+        row2.addWidget(self.sp_inc_max)
+        lab_az = QLabel("     azimut de")
+        lab_az.setToolTip(
+            "<b>Bornes d'azimut.</b> 180 = plein sud, 90 = est, 270 = ouest.<br>"
+            "La plage 90-270 couvre tout l'hemisphere utile en France. "
+            "Elargissez a 0-360 seulement pour etudier un cas particulier.")
+        row2.addWidget(lab_az)
+        self.sp_az_min = QDoubleSpinBox(); self.sp_az_min.setRange(0, 360)
+        self.sp_az_min.setValue(90); self.sp_az_min.setSuffix(" deg")
+        self.sp_az_max = QDoubleSpinBox(); self.sp_az_max.setRange(0, 360)
+        self.sp_az_max.setValue(270); self.sp_az_max.setSuffix(" deg")
+        row2.addWidget(self.sp_az_min); row2.addWidget(QLabel("a"))
+        row2.addWidget(self.sp_az_max)
+        row2.addStretch(1)
+        lay.addLayout(row2)
+
+        self.tbl_orient = table(
+            ["Optimiser", "Groupe", "kWc", "Inclinaison actuelle",
+             "Azimut actuel", "Inclinaison proposee", "Azimut propose",
+             "Changement"],
+            tips=[
+                "<b>Cochez les groupes que le calcul a le droit de reorienter.</b><br>"
+                "Decochez ceux dont l'orientation est imposee : une toiture "
+                "existante, un mur, un carport. Ils resteront dans le calcul, "
+                "avec leur orientation actuelle, mais ne bougeront pas.",
+                "Nom du groupe, repris de l'onglet 2.",
+                "Puissance crete du groupe. Le plus gros groupe est optimise "
+                "en premier : il prend l'orientation la plus rentable, les "
+                "petits viennent ensuite couvrir les heures restantes.",
+                "Inclinaison actuellement configuree, en degres.",
+                "Azimut actuellement configure. 180 = plein sud.",
+                "<b>Inclinaison proposee par le calcul.</b> Vide tant que "
+                "l'optimisation n'a pas ete lancee.",
+                "<b>Azimut propose par le calcul.</b> 180 = plein sud, "
+                "90 = est, 270 = ouest.",
+                "Ecart entre l'orientation actuelle et celle proposee. "
+                "\"inchange\" signifie que votre reglage est deja le meilleur "
+                "de la grille exploree."],
+            stretch=False)
+        self.tbl_orient.itemChanged.connect(self._orient_coche)
+        lay.addWidget(self.tbl_orient, 0)
+
+        row3 = QHBoxLayout()
+        self.b_orient = QPushButton("Lancer l'optimisation des orientations")
+        self.b_orient.setToolTip(
+            "Lance la recherche. Une simulation complete est relancee pour "
+            "chaque orientation testee : suivez l'avancement dans la barre "
+            "d'etat, en bas.")
+        self.b_orient.clicked.connect(self.run_orient)
+        row3.addWidget(self.b_orient)
+        self.b_orient_appl = QPushButton("Appliquer les orientations proposees")
+        self.b_orient_appl.setEnabled(False)
+        self.b_orient_appl.setToolTip(
+            "Ecrit les orientations proposees dans l'onglet 2 et relance la "
+            "simulation complete. Reversible : relancez une optimisation ou "
+            "ressaisissez vos valeurs a la main.")
+        self.b_orient_appl.clicked.connect(self.appliquer_orient)
+        row3.addWidget(self.b_orient_appl)
+        row3.addStretch(1)
+        self.lbl_orient_duree = QLabel("")
+        row3.addWidget(self.lbl_orient_duree)
+        lay.addLayout(row3)
+
+        self.lbl_orient = QLabel("Aucune optimisation lancee.")
+        self.lbl_orient.setWordWrap(True)
+        self.lbl_orient.setStyleSheet(
+            "background:#f1f5f9;padding:7px;border-radius:4px;")
+        lay.addWidget(self.lbl_orient)
+
+        self.cv_orient = MplCanvas(9, 3.6)
+        self.cv_orient.setToolTip(
+            "<b>Carte du critere pour chaque groupe</b>, les autres groupes "
+            "etant figes a leur orientation finale.<br>"
+            "Survolez la carte pour lire la valeur exacte. La croix marque "
+            "l'orientation retenue. Une tache large et plate signifie que "
+            "l'orientation de ce groupe importe peu : vous pouvez la choisir "
+            "pour des raisons pratiques.")
+        lay.addWidget(self.cv_orient, 1)
+
+        for widget in (self.cb_obj, self.cb_effort, self.cb_methode):
+            widget.currentIndexChanged.connect(self.maj_duree_orient)
+        for sp in (self.sp_inc_min, self.sp_inc_max, self.sp_az_min, self.sp_az_max):
+            sp.valueChanged.connect(self.maj_duree_orient)
+
+        self.tabs.addTab(w, "8. Orientations")
+        self._orient_res = None
+        self._orient_ms = 150.0      # duree mesuree d'une evaluation
+
+    # ---- tableau des groupes a optimiser ----
+    def refresh_orient(self):
+        t = self.tbl_orient
+        self._loading_orient = True
+        actifs = [(i, c) for i, c in enumerate(self.cfg["champs"])
+                  if c.get("actif", True)]
+        propose = {}
+        if self._orient_res:
+            propose = {c["index"]: c for c in self._orient_res["apres"]["champs"]}
+        t.setRowCount(len(actifs))
+        for r, (i, ch) in enumerate(actifs):
+            chk = QTableWidgetItem("")
+            chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            libre = self._orient_libres.get(i, True)
+            chk.setCheckState(Qt.CheckState.Checked if libre
+                              else Qt.CheckState.Unchecked)
+            chk.setData(Qt.ItemDataRole.UserRole, i)
+            t.setItem(r, 0, chk)
+            kwc = ch["n_panneaux"] * ch["wc_panneau"] / 1000.0
+            t.setItem(r, 1, item(ch["nom"]))
+            t.setItem(r, 2, item(f"{kwc:.2f}", align_right=True))
+            t.setItem(r, 3, item(f"{float(ch['inclinaison']):.1f}", align_right=True))
+            t.setItem(r, 4, item(f"{float(ch.get('azimut', 180)):.1f}", align_right=True))
+            p = propose.get(i)
+            if p is None:
+                for c in (5, 6, 7):
+                    t.setItem(r, c, item("-", align_right=True))
+                continue
+            d_inc = float(p["inclinaison"]) - float(ch["inclinaison"])
+            d_az = float(p["azimut"]) - float(ch.get("azimut", 180))
+            t.setItem(r, 5, item(f"{float(p['inclinaison']):.1f}", align_right=True,
+                                 bold=True, couleur=BLEU if d_inc else None))
+            t.setItem(r, 6, item(f"{float(p['azimut']):.1f}", align_right=True,
+                                 bold=True, couleur=BLEU if d_az else None))
+            if not d_inc and not d_az:
+                t.setItem(r, 7, item("inchange", align_right=True, couleur="#64748b"))
+            else:
+                bouts = []
+                if d_inc:
+                    bouts.append(f"{d_inc:+.0f} deg d'inclinaison")
+                if d_az:
+                    sens = "vers l'ouest" if d_az > 0 else "vers l'est"
+                    bouts.append(f"{abs(d_az):.0f} deg {sens}")
+                t.setItem(r, 7, item(", ".join(bouts), align_right=True,
+                                     couleur=BLEU))
+        self._loading_orient = False
+        self._ajuster_hauteur(t, mini=80, maxi=240)
+        self.maj_duree_orient()
+
+    def _orient_coche(self, it):
+        if getattr(self, "_loading_orient", False) or it.column() != 0:
+            return
+        i = it.data(Qt.ItemDataRole.UserRole)
+        if i is not None:
+            self._orient_libres[i] = it.checkState() == Qt.CheckState.Checked
+        self.maj_duree_orient()
+
+    def maj_duree_orient(self, *_):
+        n = sum(1 for i, c in enumerate(self.cfg["champs"])
+                if c.get("actif", True) and self._orient_libres.get(i, True))
+        if not n:
+            self.lbl_orient_duree.setText(
+                f"<span style='color:{ORANGE}'>Cochez au moins un groupe.</span>")
+            return
+        evals = S.estimer_evaluations(
+            n, self.cb_effort.currentData(), self.sp_inc_min.value(),
+            self.sp_inc_max.value(), self.sp_az_min.value(), self.sp_az_max.value(),
+            self.cb_methode.currentData())
+        sec = evals * self._orient_ms / 1000.0
+        duree = f"{sec:.0f} s" if sec < 90 else f"{sec / 60:.0f} min"
+        self.lbl_orient_duree.setText(
+            f"{n} groupe(s) libre(s) &bull; jusqu'a {evals} simulations "
+            f"&bull; <b>environ {duree}</b>")
+        self.lbl_orient_duree.setToolTip(
+            "Majorant : les orientations deja evaluees sont mises en cache, "
+            "et le calcul s'arrete des qu'une passe complete n'ameliore plus "
+            "rien. La duree reelle est souvent bien inferieure.")
+
+    # ---- lancement ----
+    def run_orient(self):
+        if self.meteo is None:
+            QMessageBox.information(self, "Meteo", "Chargez d'abord une serie meteo.")
+            return
+        self.pull_config()
+        libres = [i for i, c in enumerate(self.cfg["champs"])
+                  if c.get("actif", True) and self._orient_libres.get(i, True)]
+        if not libres:
+            QMessageBox.warning(self, "Aucun groupe",
+                                "Cochez au moins un groupe a reorienter.")
+            return
+        if self.sp_inc_min.value() > self.sp_inc_max.value() or \
+                self.sp_az_min.value() > self.sp_az_max.value():
+            QMessageBox.warning(self, "Plages", "Les bornes minimales doivent "
+                                                "etre inferieures aux maximales.")
+            return
+        cfg = copy.deepcopy(self.cfg)
+        objectif = self.cb_obj.currentData()
+        args = dict(libres=libres, objectif=objectif,
+                    effort=self.cb_effort.currentData(),
+                    inclinaison_min=self.sp_inc_min.value(),
+                    inclinaison_max=self.sp_inc_max.value(),
+                    azimut_min=self.sp_az_min.value(),
+                    azimut_max=self.sp_az_max.value(),
+                    methode=self.cb_methode.currentData())
+        self._orient_t0 = __import__("time").perf_counter()
+        self.b_orient.setEnabled(False)
+        self._start(Worker(S.optimize_orientations, cfg, self.meteo, **args),
+                    self._orient_pret,
+                    f"Optimisation : {S.ORIENT_OBJECTIFS[objectif][0]}")
+
+    def _orient_pret(self, res):
+        import time
+        self.b_orient.setEnabled(True)
+        if res.get("evaluations"):
+            ecoule = time.perf_counter() - getattr(self, "_orient_t0", 0)
+            self._orient_ms = max(1000.0 * ecoule / res["evaluations"], 1.0)
+        self._orient_res = res
+        self.b_orient_appl.setEnabled(True)
+        self.refresh_orient()
+        self.show_orient()
+
+    def show_orient(self):
+        r = self._orient_res
+        if not r:
+            return
+        cle = r["objectif"]
+        libelle, sens, unite, facteur, dec = S.ORIENT_OBJECTIFS[cle]
+        a = r["avant"]["metriques"][cle] * facteur
+        b = r["apres"]["metriques"][cle] * facteur
+        gain = (b - a) * sens
+        f = lambda v, n=0: f"{v:,.{n}f}".replace(",", " ")
+        coul = VERT if gain > 1e-9 else "#64748b"
+        mots = ("Aucune amelioration : votre reglage actuel est deja le meilleur "
+                "de la grille exploree." if gain <= 1e-9 else
+                f"Gain de <b>{f(abs(b - a), dec)} {unite}</b>")
+
+        ma, mb = r["avant"]["metriques"], r["apres"]["metriques"]
+        lignes = [
+            ("Autonomie annuelle", 100 * ma["autonomie"], 100 * mb["autonomie"], "%", 2),
+            ("Autonomie novembre-fevrier", 100 * ma["autonomie_hiver"],
+             100 * mb["autonomie_hiver"], "%", 2),
+            ("Soutire au reseau", ma["import"], mb["import"], "kWh/an", 0),
+            ("Production brute", ma["production"], mb["production"], "kWh/an", 0),
+            ("Autoconsomme", ma["autoconso"], mb["autoconso"], "kWh/an", 0),
+            ("Ecrete faute d'usage", ma["ecrete"], mb["ecrete"], "kWh/an", 0),
+            ("Cout annuel d'energie", ma["cout"], mb["cout"], "EUR/an", 0),
+        ]
+        tab = "".join(
+            f"<tr><td>{nom}&nbsp;&nbsp;</td>"
+            f"<td align='right'>{f(v0, d)}</td>"
+            f"<td align='right'>&nbsp;&rarr;&nbsp;<b>{f(v1, d)}</b></td>"
+            f"<td>&nbsp;{u}</td>"
+            f"<td align='right'>&nbsp;&nbsp;{f(v1 - v0, d) if abs(v1 - v0) >= 10 ** -d else ''}</td>"
+            f"</tr>"
+            for nom, v0, v1, u, d in lignes)
+
+        n_dist = len({(round(c["inclinaison"], 1), round(c["azimut"], 1))
+                      for c in r["apres"]["champs"]})
+        if r.get("methode") == "independante" and len(r["apres"]["champs"]) > 1:
+            note = ("<br><i>Mode independant : chaque groupe a ete optimise seul, "
+                    "sans voir les autres. Rien ne les pousse a se repartir la "
+                    "journee, d'ou des orientations souvent identiques. Relancez "
+                    "en methode conjointe pour laisser les groupes se "
+                    "completer.</i>")
+        elif n_dist == 1 and len(r["apres"]["champs"]) > 1:
+            note = ("<br><i>Tous les groupes convergent vers la meme orientation. "
+                    "C'est un resultat, pas un echec : quand la production "
+                    "excede largement les besoins ou que la batterie absorbe "
+                    "tout le midi, etaler les orientations n'apporte rien. "
+                    "Essayez le critere \"autonomie de novembre a fevrier\", "
+                    "ou reduisez la batterie pour voir l'etalement devenir "
+                    "payant.</i>")
+        else:
+            note = (f"<br><i>{n_dist} orientations distinctes retenues : les "
+                    f"groupes se repartissent la journee.</i>")
+
+        self.lbl_orient.setText(
+            f"<b>{libelle}</b> &mdash; <span style='color:{coul}'>{mots}</span> "
+            f"&nbsp;&bull;&nbsp; {r['evaluations']} orientations testees, "
+            f"methode {r.get('methode', 'conjointe')}, "
+            f"finesse \"{S.ORIENT_EFFORTS[r['effort']]['label']}\"<br>"
+            f"<table cellspacing='0' cellpadding='1'>{tab}</table>{note}")
+        self.draw_orient()
+
+    def draw_orient(self):
+        r = self._orient_res
+        c = self.cv_orient; c.clear()
+        grilles = (r or {}).get("grilles") or {}
+        if not grilles:
+            c.draw(); return
+        cle = r["objectif"]
+        libelle, sens, unite, facteur, dec = S.ORIENT_OBJECTIFS[cle]
+        retenu = {x["index"]: x for x in r["apres"]["champs"]}
+        n = len(grilles)
+        cols = min(n, 4)
+        rows = (n + cols - 1) // cols
+        axes = c.fig.subplots(rows, cols, squeeze=False)
+        for k in range(rows * cols):
+            ax = axes[k // cols][k % cols]
+            if k >= n:
+                ax.axis("off"); continue
+            idx = list(grilles)[k]
+            g = grilles[idx]
+            x = np.array(g["azimuts"], dtype=float)
+            y = np.array(g["inclinaisons"], dtype=float)
+            z = np.array(g["carte"], dtype=float) * facteur
+            im = ax.pcolormesh(x, y, z, shading="nearest",
+                               cmap="viridis" if sens > 0 else "viridis_r")
+            p = retenu.get(idx)
+            if p:
+                ax.plot([p["azimut"]], [p["inclinaison"]], marker="x", ms=11,
+                        mew=2.5, color="#ffffff")
+                ax.plot([p["azimut"]], [p["inclinaison"]], marker="x", ms=8,
+                        mew=1.5, color="#b91c1c")
+            nom = self.cfg["champs"][idx]["nom"]
+            court = nom if len(nom) <= 30 else "..." + nom[-27:]
+            ax.set_title(court, fontsize=8)
+            ax.set_xlabel("Azimut (deg)", fontsize=7)
+            ax.set_ylabel("Inclinaison (deg)", fontsize=7)
+            ax.tick_params(labelsize=6)
+            cb = c.fig.colorbar(im, ax=ax)
+            cb.ax.tick_params(labelsize=6)
+            c.hover2d(ax, x, y, z,
+                      ("Azimut (deg)", "Inclinaison (deg)", libelle, unite, dec),
+                      titre=nom)
+        c.fig.suptitle(
+            f"{libelle} selon l'orientation de chaque groupe "
+            f"(les autres groupes restant a leur orientation finale)", fontsize=9)
+        c.draw()
+
+    def appliquer_orient(self):
+        if not self._orient_res:
+            return
+        S.appliquer_orientations(self.cfg, self._orient_res)
+        self.refresh_champs()
+        self.refresh_orient()
+        self.run_sim()
+        self.tabs.setCurrentIndex(1)
+        self.statusBar().showMessage(
+            "Orientations appliquees aux groupes et simulation relancee.", 6000)
 
     # ======================= configuration =======================
     def push_config(self):
         self.form_site.set(self.cfg["site"])
+        self.update_aide_annees()
         self.form_module.set(self.cfg["module"])
         self.form_sys.set(self.cfg["systeme"])
         self.form_eco.set(self.cfg["economie"])
         self.refresh_champs()
         self.refresh_bom()
         self.tab_postes.refresh()
+        self.refresh_orient()
 
     def pull_config(self):
         self.cfg["site"].update(self.form_site.get())
@@ -716,6 +1771,14 @@ class MainWindow(QMainWindow):
         self.cfg["systeme"].update(self.form_sys.get())
         self.cfg["economie"].update(self.form_eco.get())
         self.tab_postes.commit()
+
+    def _tab_changed(self, idx):
+        """L'onglet des champs depend des limites saisies dans l'onglet 4 :
+        on rafraichit les tensions et les couleurs en y revenant."""
+        if idx == 1 and getattr(self, "form_sys", None) is not None:
+            self.cfg["systeme"].update(self.form_sys.get())
+            self.cfg["module"].update(self.form_module.get())
+            self.refresh_champs()
 
     def mark_dirty(self, *_):
         self.statusBar().showMessage("Configuration modifiee - F5 pour resimuler", 2500)
@@ -766,9 +1829,14 @@ class MainWindow(QMainWindow):
     def download_meteo(self):
         self.pull_config()
         s = self.cfg["site"]
+        db = s.get("base_donnees", "PVGIS-SARAH3")
+        try:
+            M.verifier_annees(int(s["annee_debut"]), int(s["annee_fin"]), db)
+        except ValueError as e:
+            QMessageBox.warning(self, "Periode indisponible", str(e))
+            return
         self._start(Worker(M.download_pvgis, float(s["latitude"]), float(s["longitude"]),
-                           int(s["annee_debut"]), int(s["annee_fin"]),
-                           s.get("base_donnees", "PVGIS-SARAH3")),
+                           int(s["annee_debut"]), int(s["annee_fin"]), db),
                     self._meteo_ready, "Telechargement PVGIS")
 
     def _meteo_ready(self, path):
@@ -795,6 +1863,10 @@ class MainWindow(QMainWindow):
         tm = [self.meteo["T2m"][self.meteo["month"] == k + 1].mean() for k in range(12)]
         ax2.plot(MOIS, tm, color="#b91c1c", marker="o")
         ax2.set_ylabel("Temperature moyenne (C)", color="#b91c1c")
+        c.hover([ax, ax2], np.arange(12),
+                [("Rayonnement horizontal", s["ghi_mensuel"], "kWh/m2", 0),
+                 ("Temperature moyenne", tm, "C", 1)],
+                xfmt=lambda i: MOIS[i], titre="Moyenne mensuelle")
         c.draw()
 
     # ======================= simulation =======================
@@ -921,6 +1993,19 @@ class MainWindow(QMainWindow):
         ax2.set_xticks(x); ax2.set_xticklabels(MOIS, fontsize=7)
         ax2.set_ylim(0, 105); ax2.set_ylabel("%")
         ax2.set_title("Autonomie mensuelle", fontsize=9)
+        c.hover(ax, x,
+                [("Production", m["production_dc"], "kWh", 0),
+                 ("Autoconsomme", m["autoconso"], "kWh", 0),
+                 ("Soutire au reseau", m["import"], "kWh", 0),
+                 ("Besoin total", m["besoin"], "kWh", 0),
+                 ("Ecrete / injecte", m["ecrete"] + m["export"], "kWh", 0),
+                 ("Autonomie", 100 * m["autonomie"], "%", 1)],
+                xfmt=lambda i: MOIS[i], titre="Bilan mensuel")
+        c.hover(ax2, x,
+                [("Autonomie", 100 * m["autonomie"], "%", 1),
+                 ("Besoin total", m["besoin"], "kWh", 0),
+                 ("Soutire au reseau", m["import"], "kWh", 0)],
+                xfmt=lambda i: MOIS[i], titre="Autonomie mensuelle")
         c.draw()
 
     def draw_jour(self):
@@ -958,6 +2043,15 @@ class MainWindow(QMainWindow):
         ax.bar(d, j["import"][sel], .35, color="#b91c1c", label="Soutirage")
         ax.set_xlabel(f"Jour de {MOIS[mo - 1]} {year}"); ax.set_ylabel("kWh/jour")
         ax.legend(fontsize=7, frameon=False)
+        c.hover(ax, d,
+                [("Production", j["production"][sel], "kWh", 1),
+                 ("Besoin total", j["besoin"][sel], "kWh", 1),
+                 ("Consommation usages", j["consommation"][sel], "kWh", 1),
+                 ("Soutire au reseau", j["import"][sel], "kWh", 1),
+                 ("Autonomie", 100 * j["autonomie"][sel], "%", 0),
+                 ("Charge minimale batterie", j["soc_min"][sel], "kWh", 1)],
+                xfmt=lambda i: f"{MOIS[mo - 1]} {int(d[i])}, {year}",
+                titre="Journee")
         c.draw()
 
     def draw_profil(self):
@@ -977,6 +2071,12 @@ class MainWindow(QMainWindow):
             ax.fill_between(range(24), prof_i, color="#b91c1c", alpha=.6)
             ax.set_title(MOIS[k], fontsize=8)
             ax.tick_params(labelsize=6)
+            c.hover(ax, np.arange(24),
+                    [("Production PV", prof_p, "kW", 2),
+                     ("Besoin", prof_c, "kW", 2),
+                     ("Soutire au reseau", prof_i, "kW", 2)],
+                    xfmt=lambda i: f"{i:02d} h - {(i + 1) % 24:02d} h",
+                    titre=f"{MOIS[k]}, journee moyenne")
         c.fig.suptitle("Journee moyenne : production (jaune), besoin (bleu), "
                        "soutirage (rouge) - kW", fontsize=9)
         c.draw()
@@ -1013,6 +2113,14 @@ class MainWindow(QMainWindow):
         ax.axhline(d["soc_max"], color="#15803d", ls="--", lw=1)
         ax.set_xlabel("Jour de la serie"); ax.set_ylabel("Etat de charge (kWh)")
         ax.set_title("Etat de charge de la batterie sur toute la serie", fontsize=9)
+        jours = np.arange(0, n, step) / 24.0
+        dates = self.meteo["dt_loc"][::step]
+        c.hover(ax, jours,
+                [("Etat de charge", soc[::step], "kWh", 1),
+                 ("Remplissage", 100 * (soc[::step] - d["soc_min"]) /
+                  max(d["utile"], 1e-9), "%", 0)],
+                xfmt=lambda i: str(dates[i].astype("datetime64[h]")).replace("T", " a ") + " h",
+                titre="Batterie")
         c.draw()
 
     def show_eco(self):
@@ -1093,6 +2201,14 @@ class MainWindow(QMainWindow):
         ax.legend(h1 + h2, l1 + l2, fontsize=8, frameon=False, loc="lower right")
         ax.set_title(f"Optimum : {x[best]:g} -> {100 * out[best]['autonomie']:.2f} % "
                      f"d'autonomie", fontsize=10, color=BLEU)
+        series = [("Autonomie", [100 * o["autonomie"] for o in out], "%", 2),
+                  ("Production", [o["production"] for o in out], "kWh/an", 0),
+                  ("Soutire au reseau", [o["import"] for o in out], "kWh/an", 0),
+                  ("Ecrete", [o["ecrete"] for o in out], "kWh/an", 0),
+                  ("Investissement", [o["capex"] for o in out], "EUR", 0)]
+        libelle = self.cb_sweep.currentText()
+        c.hover([ax, ax2], x, series,
+                xfmt=lambda i: f"{x[i]:g}", titre=libelle)
         c.draw()
         self.tabs.setCurrentIndex(6)
 
