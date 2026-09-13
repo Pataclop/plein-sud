@@ -10,27 +10,33 @@
   },
   "module": {
     "gamma_pmax": -0.0035,
+    "beta_voc_pct_k": -0.27,
     "noct_u0": 25.0,
-    "noct_u1": 6.84,
+    "noct_u1": 6.8,
+    "modele_diffus": "reindl",
     "iam_b0": 0.05,
     "pertes_dc_pct": 8.0
   },
   "systeme": {
-    "n_onduleurs": 2,
-    "p_nom_kw": 12.0,
-    "pv_max_kwc_par_onduleur": 15.6,
+    "n_onduleurs": 1,
+    "p_nom_kw": 20.0,
+    "pv_max_kwc_par_onduleur": 28.0,
     "eff_pv_ac": 0.972,
     "eff_pv_batt": 0.975,
     "eff_batt_ac": 0.945,
-    "veille_w": 55.0,
-    "veille_nuit_w": 35.0,
+    "veille_w": 130.0,
+    "veille_nuit_w": 130.0,
+    "vdc_max_v": 800.0,
+    "vmppt_min_v": 160.0,
+    "i_max_string_a": 26.0,
+    "n_mppt_par_onduleur": 4,
     "batt_kwh_nominal": 64.3,
-    "dod": 0.9,
+    "dod": 0.95,
     "eff_charge": 0.985,
     "eff_decharge": 0.985,
-    "c_rate_charge": 0.5,
-    "c_rate_decharge": 0.5,
-    "soc_initial": 0.5,
+    "c_rate_charge": 1.0,
+    "c_rate_decharge": 1.0,
+    "soc_initial": 1.0,
     "p_souscrite_kva": 12.0,
     "injection_nulle": true,
     "recharge_reseau_hc": false,
@@ -39,7 +45,7 @@
     "hc_fin": 6
   },
   "economie": {
-    "prix_kwh_achat": 0.2016,
+    "prix_kwh_achat": 0.202,
     "abonnement_an": 280.0,
     "prix_kwh_revente": 0.0,
     "facture_actuelle_an": 6093.0,
@@ -52,22 +58,15 @@
     {
       "nom": "Champ hiver (sol, 60 degres)",
       "actif": true,
-      "n_panneaux": 52,
+      "n_panneaux": 44,
       "wc_panneau": 500,
       "inclinaison": 60.0,
       "azimut": 180.0,
       "surface_m2_panneau": 2.2,
-      "ombrage_pct": 0.0
-    },
-    {
-      "nom": "Champ toiture (30 degres)",
-      "actif": true,
-      "n_panneaux": 8,
-      "wc_panneau": 500,
-      "inclinaison": 30.0,
-      "azimut": 180.0,
-      "surface_m2_panneau": 2.2,
-      "ombrage_pct": 0.0
+      "ombrage_pct": 0.0,
+      "voc_v": 49.5,
+      "isc_a": 13.9,
+      "n_serie": 11
     }
   ],
   "postes": [
@@ -76,7 +75,7 @@
       "kind": "talon",
       "actif": true,
       "params": {
-        "puissance_w": 345,
+        "puissance_w": 345.0,
         "variation_hiver": 0.15
       }
     },
@@ -85,7 +84,7 @@
       "kind": "chauffage",
       "actif": true,
       "params": {
-        "besoin_th_kwh_an": 28240,
+        "besoin_th_kwh_an": 28240.0,
         "t_base": 17.0,
         "t_consigne": 19.5,
         "cop_a": 2.75,
@@ -93,9 +92,9 @@
         "cop_max": 4.6,
         "p_pac_kw_th": 26.0,
         "declassement_froid": 0.28,
-        "part_bois": 0.35,
-        "t_bois": 5.0,
-        "inertie_h": 6
+        "part_bois": 0.2,
+        "t_bois": 3.0,
+        "inertie_h": 6.0
       }
     },
     {
@@ -103,8 +102,8 @@
       "kind": "ecs",
       "actif": true,
       "params": {
-        "besoin_th_kwh_an": 3400,
-        "cop": 2.8,
+        "besoin_th_kwh_an": 3400.0,
+        "cop": 1.0,
         "profil": "solaire",
         "majoration_hiver": 0.2
       }
@@ -209,105 +208,120 @@
       "auto": "panneaux",
       "qte": 0,
       "pu": 68.0,
-      "unite": "u"
+      "unite": "u",
+      "categorie": "pv"
     },
     {
       "poste": "Structure et fixations",
       "auto": "panneaux",
       "qte": 0,
       "pu": 72.0,
-      "unite": "u"
+      "unite": "u",
+      "categorie": "pv"
     },
     {
       "poste": "Onduleurs hybrides Deye",
       "auto": "onduleurs",
       "qte": 0,
       "pu": 1900.0,
-      "unite": "u"
+      "unite": "u",
+      "categorie": "conversion"
     },
     {
       "poste": "Cellules LFP 314 Ah grade A",
       "auto": "cellules",
       "qte": 0,
       "pu": 62.0,
-      "unite": "u"
+      "unite": "u",
+      "categorie": "stockage"
     },
     {
       "poste": "BMS 16S 200 A",
       "auto": "packs",
       "qte": 0,
-      "pu": 240.0,
-      "unite": "u"
+      "pu": 80.0,
+      "unite": "u",
+      "categorie": "stockage"
     },
     {
       "poste": "Coffrets, busbars, compression, fusibles classe T",
       "auto": "packs",
       "qte": 0,
-      "pu": 320.0,
-      "unite": "u"
+      "pu": 120.0,
+      "unite": "u",
+      "categorie": "stockage"
     },
     {
       "poste": "Cablage DC PV, connecteurs, chemins de cables",
       "auto": "kwc",
       "qte": 0,
-      "pu": 28.0,
-      "unite": "kWc"
+      "pu": 15.0,
+      "unite": "kWc",
+      "categorie": "electrique"
     },
     {
       "poste": "Cablage batterie 95 mm2 et cosses",
       "auto": "onduleurs",
       "qte": 0,
-      "pu": 320.0,
-      "unite": "u"
+      "pu": 50.0,
+      "unite": "u",
+      "categorie": "stockage"
     },
     {
       "poste": "Tableaux AC/DC, parafoudres, protections",
       "auto": "fixe",
       "qte": 1,
-      "pu": 2600.0,
-      "unite": "lot"
+      "pu": 500.0,
+      "unite": "lot",
+      "categorie": "electrique"
     },
     {
       "poste": "Terrassement, tranchee, liaison, mise a la terre",
       "auto": "fixe",
       "qte": 1,
-      "pu": 1800.0,
-      "unite": "lot"
+      "pu": 300.0,
+      "unite": "lot",
+      "categorie": "genie_civil"
     },
     {
       "poste": "Supervision et mesure par circuit",
       "auto": "fixe",
       "qte": 1,
-      "pu": 600.0,
-      "unite": "lot"
+      "pu": 200.0,
+      "unite": "lot",
+      "categorie": "electrique"
     },
     {
       "poste": "Consuel, declaration prealable, convention Enedis",
       "auto": "fixe",
       "qte": 1,
-      "pu": 400.0,
-      "unite": "lot"
+      "pu": 0.0,
+      "unite": "lot",
+      "categorie": "admin"
     },
     {
       "poste": "Chauffe-eau thermodynamique 300 L",
       "auto": "fixe",
       "qte": 1,
       "pu": 1900.0,
-      "unite": "u"
+      "unite": "u",
+      "categorie": "thermique"
     },
     {
       "poste": "Insert bois et conduit",
       "auto": "fixe",
       "qte": 1,
       "pu": 4000.0,
-      "unite": "u"
+      "unite": "u",
+      "categorie": "thermique"
     },
     {
       "poste": "Isolation combles et etancheite a l'air",
       "auto": "fixe",
       "qte": 1,
       "pu": 3000.0,
-      "unite": "lot"
+      "unite": "lot",
+      "categorie": "batiment"
     }
   ],
   "options": {

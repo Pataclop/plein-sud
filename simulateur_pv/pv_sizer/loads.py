@@ -23,9 +23,18 @@ def shape_vector(meteo: dict, profil: str) -> np.ndarray:
 
 
 def scale_to_annual(arr: np.ndarray, kwh_an: float, meteo: dict) -> np.ndarray:
-    total = arr.sum()
-    if total <= 0:
-        return np.zeros_like(arr)
+    """Met un vecteur de poids a l'echelle d'une energie annuelle.
+
+    Si la somme des poids est nulle (12 poids mensuels a zero, profil vide),
+    l'energie demandee ne peut aller nulle part : on la repartit uniformement
+    plutot que de la faire disparaitre en silence. Un poste saisi a
+    2 500 kWh/an qui ressortait a 0 kWh/an etait invisible dans le bilan.
+    """
+    total = float(np.nansum(arr))
+    if not np.isfinite(total) or total <= 0:
+        if kwh_an <= 0:
+            return np.zeros_like(arr)
+        return np.full_like(arr, kwh_an * meteo["n_years"] / max(len(arr), 1))
     return arr * (kwh_an * meteo["n_years"] / total)
 
 
@@ -39,12 +48,55 @@ def daily_redistribute(daily_energy: np.ndarray, meteo: dict, profil: str) -> np
     return daily_energy[di] * w / wsum[di]
 
 
+def repartir_sous_plafond(daily_energy: np.ndarray, meteo: dict, profil: str,
+                          p_max_kw: float):
+    """Comme daily_redistribute, mais sans jamais depasser une puissance.
+
+    Un appareil ne peut pas debiter plus que sa plaque signaletique : une
+    pompe de piscine de 750 W a laquelle on demande 12 h de filtration par
+    jour sur un profil qui ne compte que 9 heures ne tire pas 1,1 kW, elle
+    tourne simplement plus longtemps.
+
+    L'energie qui ne tient pas dans les heures du profil deborde sur les
+    heures voisines de la meme journee, par ordre de poids decroissant.
+    Retourne (kwh_par_heure, heures_saturees_par_an).
+    """
+    arr = daily_redistribute(daily_energy, meteo, profil)
+    if p_max_kw <= 0:
+        return arr, 0.0
+    di = meteo["day_index"]
+    n_jours = meteo["n_days"]
+    satures = 0
+    for _ in range(6):
+        exces = np.maximum(arr - p_max_kw, 0.0)
+        if exces.sum() <= 1e-9:
+            break
+        satures = int((exces > 1e-9).sum())
+        arr = np.minimum(arr, p_max_kw)
+        # ce qui deborde est repris sur la place restante de la meme journee
+        reste = np.bincount(di, weights=exces, minlength=n_jours)
+        place = np.maximum(p_max_kw - arr, 0.0)
+        place_jour = np.bincount(di, weights=place, minlength=n_jours)
+        ratio = np.where(place_jour > 1e-9, reste / np.maximum(place_jour, 1e-9), 0.0)
+        arr = arr + place * np.minimum(ratio[di], 1.0)
+    return arr, satures / max(meteo["n_years"], 1e-9)
+
+
 def moving_average(x: np.ndarray, hours: int) -> np.ndarray:
+    """Moyenne glissante centree, bords prolonges par la valeur extreme.
+
+    np.convolve(mode="same") complete implicitement par des ZEROS : la
+    temperature lissee des premieres heures de la serie etait tiree vers
+    0 C (8,1 C reels affiches 3,9 C avec 6 h d'inertie), ce qui fabriquait
+    un besoin de chauffage qui n'existe pas au tout debut de la serie.
+    """
     hours = int(max(1, hours))
     if hours <= 1:
         return x
     k = np.ones(hours) / hours
-    return np.convolve(x, k, mode="same")
+    marge = hours // 2
+    etendu = np.pad(x, (marge, hours - 1 - marge), mode="edge")
+    return np.convolve(etendu, k, mode="valid")
 
 
 def monthly_temperature_weights(meteo: dict, amplitude: float) -> np.ndarray:
@@ -72,11 +124,28 @@ def _generique(p, meteo):
     return scale_to_annual(w, float(p["kwh_an"]), meteo), {}
 
 
+#: consigne a laquelle le besoin thermique annuel est cense avoir ete etabli.
+#: Baisser la consigne sous cette reference reduit le besoin, la monter
+#: l'augmente, dans le rapport des degres-heures reellement calcules.
+T_CONSIGNE_REF = 19.5
+
+
 def _chauffage(p, meteo):
     t = moving_average(meteo["T2m"], p.get("inertie_h", 6))
-    besoin = np.maximum(float(p["t_base"]) - t, 0.0)
+    t_base = float(p["t_base"])
+    besoin_ref = np.maximum(t_base - t, 0.0)
 
-    th = scale_to_annual(besoin, float(p["besoin_th_kwh_an"]), meteo)
+    # La consigne agit en decalant la temperature de non-chauffage : monter
+    # le thermostat d'un degre, c'est chauffer un degre plus longtemps et
+    # un degre plus fort. Le besoin saisi correspond a T_CONSIGNE_REF ; on
+    # applique ensuite le rapport des degres-heures. A consigne de reference
+    # le facteur vaut exactement 1 et rien ne change.
+    ecart = float(p.get("t_consigne", T_CONSIGNE_REF)) - T_CONSIGNE_REF
+    besoin = np.maximum(t_base + ecart - t, 0.0) if ecart else besoin_ref
+    ref = float(besoin_ref.sum())
+    facteur = float(besoin.sum()) / ref if ref > 0 else 1.0
+
+    th = scale_to_annual(besoin, float(p["besoin_th_kwh_an"]) * facteur, meteo)
 
     # Appoint bois quand il fait froid
     part_bois = float(p.get("part_bois", 0.0))
@@ -105,6 +174,7 @@ def _chauffage(p, meteo):
         "scop_realise": float(th_pac.sum() / max((th_pac / cop).sum(), 1e-9)),
         "heures_saturation_pac": float((th_appoint > 1e-6).sum() / ny),
         "p_max_appelee_th_kw": float(th.max()),
+        "facteur_consigne": facteur,
     }
     return elec, info
 
@@ -125,7 +195,7 @@ def _piscine(p, meteo):
     di = meteo["day_index"]
     daily_e = np.bincount(di, weights=daily, minlength=meteo["n_days"]) / \
         np.maximum(np.bincount(di, minlength=meteo["n_days"]), 1)
-    pompe = daily_redistribute(daily_e, meteo, p.get("profil", "solaire"))
+    pompe, h_sat = repartir_sous_plafond(daily_e, meteo, p.get("profil", "solaire"), pk)
 
     pac = np.zeros(meteo["n"])
     kwh_pac = float(p.get("pac_piscine_kwh_an", 0.0))
@@ -134,7 +204,9 @@ def _piscine(p, meteo):
         pac = scale_to_annual(actif * shape_vector(meteo, "solaire"), kwh_pac, meteo)
     ny = meteo["n_years"]
     return pompe + pac, {"filtration_kwh_an": float(pompe.sum() / ny),
-                         "pac_kwh_an": float(pac.sum() / ny)}
+                         "pac_kwh_an": float(pac.sum() / ny),
+                         "heures_debordement_filtration": h_sat,
+                         "p_max_pompe_kw": float(pompe.max())}
 
 
 def _spa(p, meteo):
@@ -158,7 +230,10 @@ def _vehicule(p, meteo):
         return np.zeros(meteo["n"]), {}
     w = shape_vector(meteo, p.get("profil", "solaire_large"))
     jours = int(p.get("jours_par_semaine", 4))
-    dow = (meteo["dt_loc"].astype("datetime64[D]").astype(int) + 4) % 7  # 0 = lundi
+    # datetime64[D] compte les jours depuis le 1er janvier 1970, un JEUDI.
+    # Pour que lundi vaille 0 il faut donc ajouter 3, pas 4 : l'ancien
+    # decalage faisait recharger le dimanche et sautait le jeudi.
+    dow = (meteo["dt_loc"].astype("datetime64[D]").astype(int) + 3) % 7  # 0 = lundi
     w = w * (dow < jours).astype(float)
     return scale_to_annual(w, kwh, meteo), {"kwh_an": kwh}
 
@@ -174,8 +249,13 @@ def build_load(cfg: dict, meteo: dict):
     for poste in cfg["postes"]:
         if not poste.get("actif", True):
             continue
-        fn = BUILDERS.get(poste.get("kind", "generique"))
+        kind = poste.get("kind", "generique")
+        fn = BUILDERS.get(kind)
         if fn is None:
+            # ne pas escamoter un poste que l'interface continue d'afficher :
+            # on le rend visible dans le bilan et dans les alertes.
+            detail[poste["nom"]] = np.zeros(meteo["n"])
+            infos[poste["nom"]] = {"type_inconnu": kind}
             continue
         arr, info = fn(poste["params"], meteo)
         arr = np.nan_to_num(np.maximum(arr, 0.0))

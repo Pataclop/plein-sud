@@ -1430,17 +1430,35 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(w, "4. Onduleurs et batterie")
 
     # ---------------- onglet 5 : couts ----------------
+    # ---------------- onglet 5 : couts ----------------
+    #   Deux perimetres, et c'est toute la raison d'etre des categories :
+    #     * l'INSTALLATION SOLAIRE (panneaux, onduleurs, batterie, cablage,
+    #       protections, pose, demarches, outillage) : le seul chiffre qui
+    #       serve a arbitrer un dimensionnement ;
+    #     * le PROJET COMPLET, qui ajoute le chauffe-eau, l'insert et
+    #       l'isolation : utile pour le budget, jamais pour l'arbitrage.
+    BOM_COLS = ["Poste", "Categorie", "Quantite auto", "Qte (si fixe)", "Unite",
+                "Prix unitaire (EUR)", "Quantite retenue", "Montant (EUR)"]
+
     def _build_couts(self):
         w = QWidget(); lay = QVBoxLayout(w)
         lay.addWidget(QLabel(
-            "<b>Nomenclature.</b> La colonne <i>Quantite auto</i> relie la ligne a la "
-            "configuration : le nombre de panneaux, d'onduleurs, de cellules ou la "
-            "capacite batterie se mettent a jour tout seuls."))
+            "<b>Nomenclature.</b> La colonne <i>Categorie</i> range chaque ligne "
+            "dans le <b>perimetre solaire</b> (panneaux, onduleurs, batterie, "
+            "cablage, pose, demarches) ou <b>hors perimetre</b> (chauffe-eau, "
+            "insert, isolation). Seul le sous-total solaire alimente les EUR/Wc, "
+            "le cout du kWh et les couts affiches dans les onglets Optimisation, "
+            "Orientations et Leviers.<br>"
+            "La colonne <i>Quantite auto</i> relie la ligne a la configuration : "
+            "nombre de panneaux, d'onduleurs, de cellules, de grappes ou capacite "
+            "batterie se mettent a jour tout seuls."))
         self.tbl_bom = table(
-            ["Poste", "Quantite auto", "Qte (si fixe)", "Unite",
-             "Prix unitaire (EUR)", "Quantite retenue", "Montant (EUR)"],
+            self.BOM_COLS,
             tips=[
-                "<b>Libelle libre de la ligne de devis.</b>",
+                "<b>Libelle libre de la ligne de devis.</b><br>"
+                "Le libelle sert aussi a proposer une categorie automatiquement "
+                "quand vous creez une ligne.",
+                C.aide_categories(),
                 "<b>Relie la quantite a la configuration.</b><br>"
                 "Choisissez par exemple \"Nombre total de panneaux\" et la ligne "
                 "suivra automatiquement le tableau des champs PV.<br>"
@@ -1449,7 +1467,7 @@ class MainWindow(QMainWindow):
                 "<b>Quantite fixe, utilisee uniquement si la colonne precedente "
                 "est sur \"saisie manuellement\".</b><br>"
                 "Laissee a 0, elle vaut 1.",
-                "<b>Unite affichee, purement indicative</b> (u, lot, kWc, m2...).",
+                "<b>Unite affichee, purement indicative</b> (u, lot, kWc, m, m2...).",
                 "<b>Prix unitaire hors pose, en euros.</b><br>"
                 "TTC si vous raisonnez TTC : soyez simplement coherent sur "
                 "toutes les lignes.",
@@ -1457,90 +1475,285 @@ class MainWindow(QMainWindow):
                 "automatique.</b> Colonne calculee.",
                 "<b>Quantite retenue x prix unitaire.</b> Colonne calculee."])
         self.tbl_bom.itemChanged.connect(self._bom_changed)
-        lay.addWidget(self.tbl_bom, 1)
+        lay.addWidget(self.tbl_bom, 3)
+
         row = QHBoxLayout()
         b1 = QPushButton("Ajouter une ligne")
-        b1.setToolTip("Ajoute une ligne vide a la nomenclature.")
+        b1.setToolTip("Ajoute une ligne vide a la nomenclature. Sa categorie est "
+                      "proposee d'apres le libelle que vous saisissez.")
         b1.clicked.connect(self.add_bom)
         b2 = QPushButton("Supprimer la ligne")
         b2.setToolTip("Supprime la ligne selectionnee du devis.")
         b2.clicked.connect(self.del_bom)
-        row.addWidget(b1); row.addWidget(b2); row.addStretch(1)
-        self.lbl_bom = QLabel(""); row.addWidget(self.lbl_bom)
+        b3 = QPushButton("Completer la nomenclature")
+        b3.setToolTip(
+            "<b>Ajoute les postes d'une auto-installation qui manquent au devis.</b><br>"
+            "Cable solaire au metre, connecteurs MC4, coffret DC, fusibles de "
+            "grappe, parafoudres, differentiel, mise a la terre, routeur de "
+            "surplus, puis l'outillage a acheter une fois : sertisseuse, pince "
+            "MC4, pince ampermetrique continue, cle dynamometrique, EPI, "
+            "chargeur d'equilibrage.<br>"
+            "Les lignes deja presentes ne sont pas dupliquees. Les prix proposes "
+            "sont des ordres de grandeur d'achat direct, a remplacer par vos devis.")
+        b3.clicked.connect(self.completer_bom)
+        self.chk_grouper = QCheckBox("Grouper par categorie")
+        self.chk_grouper.setChecked(True)
+        self.chk_grouper.setToolTip(
+            "Affiche les lignes rangees par categorie, perimetre solaire "
+            "d'abord. Decochez pour retrouver l'ordre de saisie.")
+        self.chk_grouper.stateChanged.connect(
+            lambda *_: QTimer.singleShot(0, self.refresh_bom))
+        row.addWidget(b1); row.addWidget(b2); row.addWidget(b3)
+        row.addWidget(self.chk_grouper); row.addStretch(1)
         lay.addLayout(row)
+
+        self.tbl_recap = table(
+            ["Poste de depense", "Montant (EUR)", "Part du perimetre",
+             "Ratio utile"],
+            tips=["<b>Sous-total par categorie</b>, puis les deux perimetres.",
+                  "<b>Somme des lignes de cette categorie.</b>",
+                  "<b>Part de cette categorie dans le perimetre solaire.</b><br>"
+                  "Repere d'une installation avec stockage : environ un tiers "
+                  "de modules et structure, un tiers de batterie, le reste en "
+                  "conversion, cablage et pose.",
+                  "<b>Ratio parlant pour comparer a un devis ou a une autre "
+                  "installation.</b>"],
+            stretch=True)
+        self.tbl_recap.setMaximumHeight(330)
+        lay.addWidget(self.tbl_recap, 2)
+
+        self.lbl_bom = QLabel("")
+        self.lbl_bom.setWordWrap(True)
+        lay.addWidget(self.lbl_bom)
+
         self.form_eco = SchemaForm(
             [("__grp", "Hypotheses economiques", None, None, None, None, "")] + C.ECO_SCHEMA,
             on_change=self.mark_dirty)
         sc = QScrollArea(); sc.setWidgetResizable(True); sc.setWidget(self.form_eco)
-        sc.setMaximumHeight(260)
+        sc.setMaximumHeight(230)
         lay.addWidget(sc)
         self.txt_eco = QTextEdit(); self.txt_eco.setReadOnly(True)
-        self.txt_eco.setMaximumHeight(210)
-        lay.addWidget(self.txt_eco)
+        self.txt_eco.setMinimumHeight(230)
+        lay.addWidget(self.txt_eco, 2)
         self.tabs.addTab(w, "5. Couts")
+
+    def _bom_index(self, row):
+        """Index dans cfg['bom'] de la ligne affichee a cette ligne du tableau."""
+        ordre = getattr(self, "_bom_ordre", None)
+        if ordre is None or not (0 <= row < len(ordre)):
+            return None
+        return ordre[row]
 
     def _bom_changed(self, it):
         if getattr(self, "_loading_bom", False):
             return
-        r, c = it.row(), it.column()
-        if r >= len(self.cfg["bom"]):
+        i = self._bom_index(it.row())
+        if i is None:
             return
-        l = self.cfg["bom"][r]
+        l = self.cfg["bom"][i]
+        c = it.column()
         try:
             if c == 0:
+                ancien = l.get("poste", "")
                 l["poste"] = it.text()
-            elif c == 2:
-                l["qte"] = float(it.text().replace(",", ".").replace(" ", ""))
+                # une ligne encore sur la categorie par defaut suit le libelle
+                if l.get("categorie") in (None, "divers") or \
+                        l.get("categorie") == C.deviner_categorie(ancien, l.get("auto", "fixe")):
+                    l["categorie"] = C.deviner_categorie(it.text(), l.get("auto", "fixe"))
             elif c == 3:
-                l["unite"] = it.text()
+                l["qte"] = float(it.text().replace(",", ".").replace(" ", ""))
             elif c == 4:
+                l["unite"] = it.text()
+            elif c == 5:
                 l["pu"] = float(it.text().replace(",", ".").replace(" ", ""))
         except ValueError:
             pass
-        self.refresh_bom(); self.mark_dirty()
+        QTimer.singleShot(0, self._rafraichir_couts)
 
     def refresh_bom(self):
         self._loading_bom = True
-        lignes, total = S.compute_bom(self.cfg)
+        lignes, recap = S.compute_bom(self.cfg)
+
+        grouper = bool(getattr(self, "chk_grouper", None) is not None
+                       and self.chk_grouper.isChecked())
+        ordre = list(range(len(lignes)))
+        if grouper:
+            rang = {c: i for i, c in enumerate(C.ORDRE_CATEGORIES)}
+            ordre.sort(key=lambda i: (rang.get(lignes[i]["categorie"], 99), i))
+        self._bom_ordre = ordre
+
         t = self.tbl_bom
-        t.setRowCount(len(lignes))
-        for r, l in enumerate(lignes):
-            t.setItem(r, 0, item(l["poste"], editable=True))
+        t.setRowCount(len(ordre))
+        cat_precedente = None
+        for r, i in enumerate(ordre):
+            l = lignes[i]
+            cat = l["categorie"]
+            entete = grouper and cat != cat_precedente
+            cat_precedente = cat
+            teinte = QColor("#f1f5f9") if l["solaire"] else QColor("#fdf4e7")
+            t.setItem(r, 0, item(l["poste"], editable=True,
+                                 tip=C.BOM_CATEGORIES[cat]["aide"]))
             cb = QComboBox()
-            for k, lab in C.AUTO_QTY.items():
-                cb.addItem(lab, k)
-            i = list(C.AUTO_QTY).index(l.get("auto", "fixe"))
-            cb.setCurrentIndex(i)
+            for k in C.ORDRE_CATEGORIES:
+                cb.addItem(C.BOM_CATEGORIES[k]["label"], k)
+            cb.setCurrentIndex(C.ORDRE_CATEGORIES.index(cat))
+            cb.setToolTip(C.aide_categories())
             cb.currentIndexChanged.connect(
-                lambda _i, row=r, box=None: self._set_auto(row, _i))
+                lambda _i, row=r: self._set_categorie(row, _i))
             t.setCellWidget(r, 1, cb)
-            t.setItem(r, 2, item(l.get("qte", 0), editable=True, align_right=True))
-            t.setItem(r, 3, item(l.get("unite", ""), editable=True))
-            t.setItem(r, 4, item(f"{l.get('pu', 0):.2f}", editable=True, align_right=True))
-            t.setItem(r, 5, item(f"{l['qte_calc']:,.1f}".replace(",", " "), align_right=True))
-            t.setItem(r, 6, item(f"{l['montant']:,.0f} EUR".replace(",", " "),
+            cb2 = QComboBox()
+            for k, lab in C.AUTO_QTY.items():
+                cb2.addItem(lab, k)
+            # une regle de quantite disparue d'une version a l'autre ne doit
+            # pas empecher l'onglet de s'afficher : compute_bom l'a deja
+            # ramenee sur "fixe", on se contente de suivre.
+            cles = list(C.AUTO_QTY)
+            auto = l.get("auto", "fixe")
+            cb2.setCurrentIndex(cles.index(auto) if auto in cles else 0)
+            cb2.currentIndexChanged.connect(
+                lambda _i, row=r: self._set_auto(row, _i))
+            t.setCellWidget(r, 2, cb2)
+            t.setItem(r, 3, item(l.get("qte", 0), editable=True, align_right=True))
+            t.setItem(r, 4, item(l.get("unite", ""), editable=True))
+            t.setItem(r, 5, item(f"{l.get('pu', 0):.2f}", editable=True, align_right=True))
+            t.setItem(r, 6, item(f"{l['qte_calc']:,.1f}".replace(",", " "), align_right=True))
+            t.setItem(r, 7, item(f"{l['montant']:,.0f}".replace(",", " "),
                                  align_right=True, bold=True))
+            for c in range(len(self.BOM_COLS)):
+                cell = t.item(r, c)
+                if cell is not None:
+                    cell.setBackground(teinte)
+                    if entete and c == 0:
+                        f = cell.font(); f.setBold(True); cell.setFont(f)
         self._loading_bom = False
+        self._remplir_recap(recap)
+
+    def _remplir_recap(self, recap):
+        """Sous-totaux par categorie, puis les deux perimetres."""
         kwc = S.total_kwc(self.cfg)
-        self.lbl_bom.setText(f"<b>Total : {total:,.0f} EUR</b> &nbsp;&bull;&nbsp; "
-                             f"{total / max(kwc * 1000, 1):.2f} EUR/Wc"
-                             .replace(",", " "))
+        wc = max(kwc * 1000.0, 1e-9)
+        batt = max(float(self.cfg["systeme"]["batt_kwh_nominal"]), 1e-9)
+        n_pan = max(S.total_panneaux(self.cfg), 1)
+        n_ond = max(int(self.cfg["systeme"]["n_onduleurs"]), 1)
+        sol = max(recap["solaire"], 1e-9)
+        f = lambda v, d=0: f"{v:,.{d}f}".replace(",", " ")
+
+        ratios = {
+            "pv": lambda m: f"{m / n_pan:,.0f} EUR/panneau".replace(",", " "),
+            "conversion": lambda m: f"{m / n_ond:,.0f} EUR/onduleur".replace(",", " "),
+            "stockage": lambda m: f"{m / batt:,.0f} EUR/kWh de batterie".replace(",", " "),
+            "electrique": lambda m: f"{1000 * m / wc:.2f} EUR/kWc",
+            "genie_civil": lambda m: f"{1000 * m / wc:.2f} EUR/kWc",
+        }
+
+        t = self.tbl_recap
+        lignes = []
+        for k in C.ORDRE_CATEGORIES:
+            m = recap["par_categorie"].get(k, 0.0)
+            if m == 0:
+                continue
+            d = C.BOM_CATEGORIES[k]
+            part = f"{100 * m / sol:.0f} %" if d["solaire"] else "-"
+            ratio = ratios.get(k, lambda _m: "")(m)
+            lignes.append((("  " + d["label"]), m, part, ratio, d["solaire"], False))
+        lignes.append(("PERIMETRE SOLAIRE", recap["solaire"], "100 %",
+                       f"{recap['solaire'] / wc:.2f} EUR/Wc installe",
+                       True, True))
+        lignes.append(("Hors perimetre solaire", recap["hors_solaire"], "-",
+                       "chauffage, ECS, isolation", False, True))
+        lignes.append(("PROJET COMPLET", recap["total"], "-",
+                       f"{recap['total'] / wc:.2f} EUR/Wc, tout compris",
+                       False, True))
+
+        t.setRowCount(len(lignes))
+        for r, (nom, m, part, ratio, solaire, gras) in enumerate(lignes):
+            coul = VERT if (solaire and gras) else (BLEU if solaire else ORANGE)
+            t.setItem(r, 0, item(nom, bold=gras, couleur=coul if gras else None))
+            t.setItem(r, 1, item(f(m), align_right=True, bold=gras,
+                                 couleur=coul if gras else None))
+            t.setItem(r, 2, item(part, align_right=True))
+            t.setItem(r, 3, item(ratio, couleur="#64748b"))
+
+        # Repere de marche : 1,80 a 2,50 EUR/Wc pose par un installateur pour
+        # une installation avec stockage (source : devis courants 2025). Le
+        # rapport entre les deux chiffre la valeur du travail fourni.
+        pro_bas, pro_haut = 1.80, 2.50
+        eur_wc = recap["solaire"] / wc
+        econ_bas = max(pro_bas * wc - recap["solaire"], 0.0)
+        econ_haut = max(pro_haut * wc - recap["solaire"], 0.0)
+        self.lbl_bom.setText(
+            f"<b>Installation solaire : {f(recap['solaire'])} EUR</b> "
+            f"&nbsp;({eur_wc:.2f} EUR/Wc pour {kwc:.1f} kWc, "
+            f"{recap['par_categorie'].get('stockage', 0) / batt:.0f} EUR/kWh de batterie)"
+            f"<br>Projet complet : {f(recap['total'])} EUR, dont "
+            f"{f(recap['hors_solaire'])} EUR hors perimetre solaire."
+            f"<br><span style='color:#15803d'>Pose par un installateur, ces "
+            f"{kwc:.1f} kWc avec stockage se chiffreraient {f(pro_bas * wc)} a "
+            f"{f(pro_haut * wc)} EUR ({pro_bas:.2f} a {pro_haut:.2f} EUR/Wc). "
+            f"L'auto-installation economise de l'ordre de {f(econ_bas)} a "
+            f"{f(econ_haut)} EUR.</span>")
+
+    def _rafraichir_couts(self):
+        """Redessine le devis et propage aux ecrans qui affichent un cout.
+
+        Differe d'un tour de boucle d'evenements : ces deux fonctions sont
+        appelees depuis le signal d'une liste deroulante que refresh_bom()
+        va detruire en reconstruisant la ligne. Detruire un widget pendant
+        l'emission de son propre signal fait tomber Qt.
+        """
+        self.refresh_bom()
+        self.mark_dirty()
+        if self.res:
+            self.show_eco()
+            self.show_results_kpi()
+
+    def _set_categorie(self, row, idx):
+        if getattr(self, "_loading_bom", False):
+            return
+        i = self._bom_index(row)
+        if i is None:
+            return
+        self.cfg["bom"][i]["categorie"] = C.ORDRE_CATEGORIES[idx]
+        QTimer.singleShot(0, self._rafraichir_couts)
 
     def _set_auto(self, row, idx):
         if getattr(self, "_loading_bom", False):
             return
-        self.cfg["bom"][row]["auto"] = list(C.AUTO_QTY)[idx]
-        self.refresh_bom(); self.mark_dirty()
+        i = self._bom_index(row)
+        if i is None:
+            return
+        self.cfg["bom"][i]["auto"] = list(C.AUTO_QTY)[idx]
+        QTimer.singleShot(0, self._rafraichir_couts)
 
     def add_bom(self):
-        self.cfg["bom"].append({"poste": "Nouveau poste", "auto": "fixe",
-                                "qte": 1, "pu": 0.0, "unite": "u"})
+        self.cfg["bom"].append({"poste": "Nouveau poste", "categorie": "divers",
+                                "auto": "fixe", "qte": 1, "pu": 0.0, "unite": "u"})
         self.refresh_bom(); self.mark_dirty()
+
+    def completer_bom(self):
+        """Ajoute les postes d'auto-installation absents du devis."""
+        presents = {str(l.get("poste", "")).strip().lower() for l in self.cfg["bom"]}
+        ajoutes = [copy.deepcopy(l) for l in C.BOM_COMPLEMENT
+                   if l["poste"].strip().lower() not in presents]
+        if not ajoutes:
+            QMessageBox.information(
+                self, "Nomenclature",
+                "Tous les postes de la nomenclature type sont deja presents.")
+            return
+        self.cfg["bom"].extend(ajoutes)
+        self.refresh_bom(); self.mark_dirty()
+        QMessageBox.information(
+            self, "Nomenclature",
+            f"{len(ajoutes)} poste(s) ajoute(s) au devis.\n\n"
+            "Les prix proposes sont des ordres de grandeur d'achat direct 2025 : "
+            "remplacez-les par vos propres devis avant de conclure quoi que ce "
+            "soit sur le temps de retour.")
 
     def del_bom(self):
         r = self.tbl_bom.currentRow()
-        if 0 <= r < len(self.cfg["bom"]):
-            del self.cfg["bom"][r]
+        i = self._bom_index(r)
+        if i is not None:
+            del self.cfg["bom"][i]
             self.refresh_bom(); self.mark_dirty()
 
     # ---------------- onglet 6 : resultats ----------------
@@ -1557,10 +1770,19 @@ class MainWindow(QMainWindow):
             "<b>kWh consommes/an</b> : besoin total, veille des onduleurs "
             "comprise.<br>"
             "<b>kWh produits/an</b> : production des panneaux, avant ecretage.<br>"
-            "<b>Investissement</b> : total de la nomenclature de l'onglet 5.<br>"
-            "<b>Retour</b> : nombre d'annees pour rembourser cet "
-            "investissement par les economies, face a votre facture actuelle "
-            "et avec l'inflation energie supposee.")
+            "<b>Installation solaire</b> : sous-total des categories 1 a 8 de "
+            "la nomenclature (panneaux, structure, onduleurs, batterie, "
+            "cablage, pose, demarches, outillage). Le chauffe-eau, l'insert et "
+            "l'isolation en sont exclus : ils apparaissent dans la ligne "
+            "\"projet complet\" juste en dessous.<br>"
+            "<b>Retour de l'installation solaire</b> : nombre d'annees pour "
+            "rembourser ce seul investissement par l'energie que les panneaux "
+            "et la batterie evitent d'acheter, a maison inchangee. C'est ce "
+            "chiffre qu'il faut regarder pour decider d'un panneau ou d'un "
+            "pack de batterie de plus.<br>"
+            "<i>Le retour du projet complet, lui, se compare a la facture "
+            "declaree avant travaux : il melange l'effet du solaire et celui "
+            "du chauffage et de l'isolation.</i>")
         self.lbl_kpi.setStyleSheet(
             f"background:{BLEU};color:white;padding:9px;border-radius:4px;")
         lay.addWidget(self.lbl_kpi)
@@ -1598,12 +1820,18 @@ class MainWindow(QMainWindow):
                 "ou via la batterie. C'est l'energie qui vous fait economiser.",
                 "<b>Energie achetee au reseau sur le mois.</b><br>"
                 "C'est ce poste, multiplie par le prix du kWh, qui constitue "
-                "votre facture.",
+                "votre facture.<br>"
+                "<i>Si la recharge de la batterie en heures creuses est "
+                "activee, cette colonne inclut l'energie achetee pour remplir "
+                "la batterie. L'autonomie, elle, n'en tient pas compte deux "
+                "fois : un kWh achete la nuit reste un kWh du reseau, meme "
+                "restitue le lendemain matin.</i>",
                 "<b>Production perdue ou revendue.</b><br>"
                 "Ecretee quand la batterie est pleine et la maison servie "
                 "(injection nulle), injectee si la revente est activee.",
-                "<b>Autonomie = 1 - import / besoin.</b><br>"
-                "Part du besoin couverte sans le reseau.<br>"
+                "<b>Part du besoin couverte sans acheter d'electricite.</b><br>"
+                "= 1 - (reseau qui alimente directement la maison + part "
+                "d'origine reseau de ce que la batterie restitue) / besoin.<br>"
                 "Vert au-dela de 90 %, orange de 70 a 90 %, rouge en dessous.",
                 "<b>Consommation moyenne d'une journee de ce mois.</b>",
                 "<b>Production moyenne d'une journee de ce mois.</b>",
@@ -1718,11 +1946,37 @@ class MainWindow(QMainWindow):
             "respecte encore l'objectif d'autonomie. Le resultat remplit la "
             "derniere colonne du bilan mensuel de l'onglet 6.")
         bb.clicked.connect(self.run_budget)
+        row.addWidget(bb)        # le bouton n'etait jamais ajoute a la barre
+
+        lab_s = QLabel("Tranche a rembourser en moins de :")
+        self.sp_seuil_tranche = QDoubleSpinBox()
+        self.sp_seuil_tranche.setRange(1, 40)
+        self.sp_seuil_tranche.setValue(10)
+        self.sp_seuil_tranche.setDecimals(0)
+        self.sp_seuil_tranche.setSuffix(" ans")
+        aide_seuil = (
+            "<b>Au-dela de combien d'annees refusez-vous une tranche "
+            "supplementaire ?</b><br>"
+            "Sert de critere d'arret dans la vue <i>Amortissement par "
+            "tranche</i> et dans la recherche d'optimum : la derniere tranche "
+            "dont le temps de retour propre reste sous ce seuil est celle ou "
+            "s'arreter.<br>"
+            "8 a 12 ans est un choix courant pour du materiel dont la duree de "
+            "vie utile est de 15 a 25 ans.")
+        lab_s.setToolTip(aide_seuil)
+        self.sp_seuil_tranche.setToolTip(aide_seuil)
+        self.sp_seuil_tranche.valueChanged.connect(self._seuil_change)
+        row.addWidget(lab_s)
+        row.addWidget(self.sp_seuil_tranche)
+        row.addStretch(1)
         lay.addLayout(row)
         self.tbl_sweep = table(
             ["Valeur testee", "Autonomie (%)", "Production (kWh/an)",
              "Import reseau (kWh/an)", "Ecrete (kWh/an)",
-             "Investissement (EUR)", "Retour (ans)", "ROI marginal"],
+             "Cout installation solaire (EUR)", "EUR/Wc",
+             "Retour cumule (ans)",
+             "Tranche", "Cout de la tranche (EUR)", "Gain de la tranche (EUR/an)",
+             "RETOUR DE LA TRANCHE (ans)", "ROI marginal"],
             tips=[
                 "Valeur donnee au parametre balaye pour cette simulation. "
                 "La meilleure ligne est en gras.",
@@ -1731,13 +1985,46 @@ class MainWindow(QMainWindow):
                 "Energie achetee au reseau sur l'annee.",
                 "Production perdue faute de place dans la batterie et "
                 "d'usage immediat.",
-                "Cout total issu de la nomenclature de l'onglet 5, recalcule "
-                "pour chaque valeur testee.",
-                "Nombre d'annees pour rembourser l'investissement par les "
-                "economies, face a votre facture actuelle.",
-                "Taux de rentabilite marginale de l'unite supplementaire : "
-                "gain annuel ajoute / cout supplementaire. Exemple : 0.25 "
-                "signifie un remboursement en 4 ans."])
+                "<b>Sous-total du PERIMETRE SOLAIRE uniquement</b> : panneaux, "
+                "structure, onduleurs, batterie, cablage, protections, pose, "
+                "demarches, outillage.<br>"
+                "Le chauffe-eau, l'insert et l'isolation sont exclus : ils ne "
+                "bougent pas d'une valeur testee a l'autre et n'ont rien a "
+                "faire dans l'arbitrage.",
+                "Cout du perimetre solaire ramene au watt-crete installe. "
+                "Repere : 1,80 a 2,50 EUR/Wc pose par un installateur, "
+                "stockage compris.",
+                "<b>Temps de retour de l'installation ENTIERE</b> a ce "
+                "niveau de dimensionnement : investissement solaire total "
+                "divise par l'economie annuelle totale, inflation comprise.<br>"
+                "<i>Attention : ce chiffre est une moyenne. Une premiere "
+                "batterie amortie en 3 ans suivie d'une seconde qui ne "
+                "s'amortit jamais donnent environ 6 ans, ce qui masque "
+                "exactement la decision a prendre. Regardez plutot les quatre "
+                "colonnes suivantes.</i>",
+                "<b>Ce que cette ligne ajoute par rapport a la precedente</b>, "
+                "dans l'unite du parametre balaye : +16 kWh de batterie, "
+                "+5 kWc de panneaux...",
+                "<b>Surcout de materiel de cette seule tranche</b>, perimetre "
+                "solaire : ce que vous sortez de votre poche pour passer de la "
+                "ligne precedente a celle-ci.",
+                "<b>Euros economises en plus chaque annee</b> grace a cette "
+                "seule tranche. Il s'effondre a mesure que l'installation "
+                "grossit : les premiers kWh de batterie servent tous les "
+                "soirs, les derniers ne servent que quelques jours d'hiver.",
+                "<b>Annees pour que CETTE TRANCHE se rembourse toute seule</b>, "
+                "independamment de tout ce qui a ete installe avant, "
+                "inflation de l'energie comprise.<br>"
+                "C'est le chiffre a regarder pour un projet que l'on fait "
+                "grossir par etapes : il repond a \"est-ce que la prochaine "
+                "batterie vaut le coup ?\", ce que le retour cumule ne dit "
+                "pas.<br>"
+                "<b>jamais</b> : la tranche coute et ne rapporte rien. "
+                "<b>&gt; horizon</b> : elle finirait par se rembourser, mais "
+                "apres la duree d'analyse.",
+                "Euros economises chaque annee par euro supplementaire investi "
+                "sur cette tranche. C'est l'inverse du retour de la tranche : "
+                "0,25 = remboursement en 4 ans."])
         lay.addWidget(self.tbl_sweep, 1)
         sub = QTabWidget()
         self.cv_sweep = MplCanvas(9, 4)
@@ -1757,6 +2044,22 @@ class MainWindow(QMainWindow):
         self.cv_sweep_bar.set_plot(self.draw_sweep_bar,
                                    "Balayage : comparaison des options")
         sub.addTab(self.cv_sweep_bar, "Comparaison des options")
+
+        self.cv_sweep_tranche = MplCanvas(9, 4)
+        self.cv_sweep_tranche.setToolTip(
+            "<b>Combien de temps met la tranche suivante a se rembourser "
+            "elle-meme ?</b><br>"
+            "Le temps de retour habituel porte sur l'installation entiere : "
+            "une premiere batterie amortie en 3 ans suivie d'une seconde qui "
+            "ne s'amortira jamais donnent un retour global d'environ 6 ans, "
+            "chiffre qui masque exactement la decision a prendre.<br>"
+            "Ici chaque tranche est jugee seule, independamment des "
+            "precedentes : c'est la vue a utiliser pour un projet que l'on "
+            "fait grossir par etapes." + HINT)
+        self.cv_sweep_tranche.set_plot(self.draw_sweep_tranche,
+                                       "Balayage : amortissement par tranche")
+        sub.addTab(self.cv_sweep_tranche, "Amortissement par tranche")
+        sub.addTab(self._build_grille(), "Optimum PV x batterie")
         lay.addWidget(sub, 1)
         self.tabs.addTab(w, "7. Optimisation")
 
@@ -1853,7 +2156,7 @@ class MainWindow(QMainWindow):
 
         self.tbl_leviers = table(
             ["Action", "Type", "Reseau evite", "Gain (EUR/an)", "Cout (EUR)",
-             "Retour (ans)", "Gain / 1000 EUR", "Autonomie"],
+             "Perimetre", "Retour (ans)", "Gain / 1000 EUR", "Autonomie"],
             tips=[
                 "Action simulee, une simulation complete par ligne.",
                 "Production = plus de panneaux ou d'onduleurs. Stockage = "
@@ -1862,9 +2165,19 @@ class MainWindow(QMainWindow):
                 "Energie qui ne serait plus achetee au reseau, par an.",
                 "Baisse de la facture annuelle : reseau evite, revente et "
                 "bois compris.",
-                "Surcout d'investissement, calcule sur la nomenclature de "
-                "l'onglet 5. Vide quand le cout depend d'une decision que le "
-                "simulateur ne connait pas.",
+                "Surcout d'investissement. Pour un panneau, un pack de "
+                "batterie ou un onduleur, il est recalcule sur le PERIMETRE "
+                "SOLAIRE de la nomenclature de l'onglet 5 : le chauffe-eau, "
+                "l'insert et l'isolation n'y entrent pas.<br>"
+                "Vide quand le cout depend d'une decision que le simulateur ne "
+                "connait pas (appareil remplace, travaux).",
+                "<b>Solaire</b> : le surcout tombe dans le perimetre de "
+                "l'installation solaire, donc dans les EUR/Wc et le temps de "
+                "retour de l'installation.<br>"
+                "<b>Hors solaire</b> : un appareil, des travaux ou un simple "
+                "reglage. Le gain est bien reel, mais il ne se compare pas a "
+                "un panneau de plus.<br>"
+                "<b>Gratuit</b> : rien a acheter, seulement a programmer.",
                 "Annees pour rembourser l'action par le gain annuel.",
                 "Gain annuel rapporte a 1 000 EUR investis : c'est le "
                 "classement a regarder pour arbitrer entre panneaux, batterie "
@@ -1941,11 +2254,22 @@ class MainWindow(QMainWindow):
                 t.setItem(r, 3, it)
                 t.setItem(r, 4, item(f(a["cout"]) if a["cout"] > 0 else "a chiffrer",
                                      align_right=True))
-                t.setItem(r, 5, item(f"{a['retour']:.1f}" if a["retour"] else "-",
+                if a.get("cout_solaire", 0) > 0:
+                    perim, coul = "solaire", BLEU
+                elif a["cout"] > 0:
+                    perim, coul = "hors solaire", ORANGE
+                elif a["categorie"] == "Pilotage":
+                    perim, coul = "gratuit", VERT
+                else:
+                    # sobriete : le gain est mesure, le cout depend de l'action
+                    # retenue (appareil, travaux, simple habitude)
+                    perim, coul = "a chiffrer", "#64748b"
+                t.setItem(r, 5, item(perim, couleur=coul))
+                t.setItem(r, 6, item(f"{a['retour']:.1f}" if a["retour"] else "-",
                                      align_right=True))
-                t.setItem(r, 6, item(f"{a['gain_par_1000']:.0f}"
+                t.setItem(r, 7, item(f"{a['gain_par_1000']:.0f}"
                                      if a["gain_par_1000"] else "-", align_right=True))
-                t.setItem(r, 7, item(f"{100 * a['autonomie']:.1f} %", align_right=True))
+                t.setItem(r, 8, item(f"{100 * a['autonomie']:.1f} %", align_right=True))
 
         self.lbl_leviers.setText(self._resume_leviers(at, lv))
         self.draw_leviers()
@@ -2001,8 +2325,19 @@ class MainWindow(QMainWindow):
         if perdants:
             txt.append("Sans effet ou contre-productif ici : " +
                        ", ".join(a["nom"] for a in perdants[:3]) + ".")
+        solaires = [a for a in chiffres if a.get("cout_solaire", 0) > 0]
+        if solaires:
+            m = max(solaires, key=lambda a: a["gain_par_1000"])
+            txt.append(
+                f"<b>Meilleur euro depense dans l'installation solaire "
+                f"elle-meme</b> : {m['nom']} &mdash; {f(m['cout_solaire'])} EUR "
+                f"de materiel pour {f(m['gain_an'])} EUR/an, retour en "
+                f"{m['retour']:.1f} ans. Ce chiffre est comparable d'une option "
+                f"a l'autre parce qu'il ne contient que du perimetre solaire.")
         txt.append("<i>Les lignes \"a chiffrer\" ne portent pas de cout : le "
-                   "simulateur mesure le gain, a vous de le comparer au devis.</i>")
+                   "simulateur mesure le gain, a vous de le comparer au devis. "
+                   "La colonne <b>Perimetre</b> dit si le surcout entre dans "
+                   "l'installation solaire ou non.</i>")
         return "<br>".join(txt)
 
     def draw_leviers(self, cv=None):
@@ -2708,9 +3043,17 @@ class MainWindow(QMainWindow):
         except Exception:
             QMessageBox.critical(self, "Erreur", traceback.format_exc()[-2500:])
             return
-        # le classement des leviers portait sur l'ancienne configuration
+        # le classement des leviers et le budget de consommation portaient
+        # sur l'ancienne configuration : les garder afficherait, a cote des
+        # nouveaux resultats, des chiffres calcules sur une autre installation
         self._leviers = None
+        self._budget = None
         self.show_results()
+
+    @staticmethod
+    def _opt(valeur, gabarit="{:.3f}", defaut="-"):
+        """Formate une grandeur qui peut ne pas etre calculable."""
+        return defaut if valeur is None else gabarit.format(valeur)
 
     def _retour_txt(self, retour, d=1):
         """Temps de retour en annees decimales, ou '>horizon' si jamais rembourse."""
@@ -2718,9 +3061,14 @@ class MainWindow(QMainWindow):
             return f"{retour:.{d}f}"
         return ">" + str(self.cfg["economie"].get("duree_analyse_ans", 25))
 
-    def show_results(self):
-        r, k, e = self.res, self.res["kpi"], self.res["eco"]
+    def show_results_kpi(self):
+        """Bandeau de tete. L'investissement affiche est celui du PERIMETRE
+        SOLAIRE, avec son propre temps de retour : c'est le couple qui a un
+        sens pour juger le dimensionnement. Le projet complet est rappele en
+        petit juste en dessous."""
+        k, e = self.res["kpi"], self.res["eco"]
         f = lambda v, d=0: f"{v:,.{d}f}".replace(",", " ")
+        hors = e["capex_hors_solaire"]
         self.lbl_kpi.setText(
             f"<table width='100%'><tr>"
             f"<td><span style='font-size:20pt'><b>{100 * k['autonomie']:.1f} %</b></span>"
@@ -2731,12 +3079,24 @@ class MainWindow(QMainWindow):
             f"<br><small>kWh CONSOMMES / AN</small></td>"
             f"<td><span style='font-size:20pt'><b>{f(k['production_an'])}</b></span>"
             f"<br><small>kWh PRODUITS / AN</small></td>"
-            f"<td><span style='font-size:20pt'><b>{f(e['capex'])} EUR</b></span>"
-            f"<br><small>INVESTISSEMENT</small></td>"
+            f"<td><span style='font-size:20pt;color:{BLEU}'>"
+            f"<b>{f(e['capex_solaire'])} EUR</b></span>"
+            f"<br><small>INSTALLATION SOLAIRE &nbsp;({e['cout_par_wc']:.2f} EUR/Wc)"
+            f"</small></td>"
             f"<td><span style='font-size:20pt'><b>"
-            f"{self._retour_txt(e['retour_ans_vs_actuel'])} ans</b>"
-            f"</span><br><small>RETOUR / FACTURE ACTUELLE</small></td>"
-            f"</tr></table>")
+            f"{self._retour_txt(e['retour_ans_vs_sans_pv'])} ans</b>"
+            f"</span><br><small>RETOUR DE L'INSTALLATION SOLAIRE</small></td>"
+            f"</tr></table>"
+            f"<small style='color:#64748b'>Projet complet "
+            f"{f(e['capex_total'])} EUR (dont {f(hors)} EUR hors perimetre "
+            f"solaire : chauffe-eau, insert, isolation) &mdash; retour "
+            f"{self._retour_txt(e['retour_ans_vs_actuel'])} ans face a la "
+            f"facture declaree.</small>")
+
+    def show_results(self):
+        r, k, e = self.res, self.res["kpi"], self.res["eco"]
+        f = lambda v, d=0: f"{v:,.{d}f}".replace(",", " ")
+        self.show_results_kpi()
 
         col = {"erreur": "#b91c1c", "attention": "#d97706", "info": "#1f4e79"}
         self.lbl_alertes.setText("<br>".join(
@@ -2761,8 +3121,15 @@ class MainWindow(QMainWindow):
             t.setItem(i, 8, it)
             t.setItem(i, 9, item(f"{m['conso_jour'][i]:.1f}", align_right=True))
             t.setItem(i, 10, item(f"{m['prod_jour'][i]:.1f}", align_right=True))
-            t.setItem(i, 11, item(f"{budget[i][1]:.1f}" if budget else "-",
-                                  align_right=True))
+            bud = budget[i][1] if budget else None
+            it_b = item(self._opt(bud, "{:.1f}"), align_right=True)
+            if budget and bud is None:
+                it_b.setToolTip(
+                    "Meme reduite a 2 % de sa valeur, la consommation de ce "
+                    "mois ne permet pas d'atteindre l'objectif d'autonomie : "
+                    "c'est la production, pas la consommation, qui manque.")
+                it_b.setForeground(QColor(ROUGE))
+            t.setItem(i, 11, it_b)
         tot = [m["consommation"].sum(), m["veille"].sum(), m["besoin"].sum(),
                m["production_dc"].sum(), m["autoconso"].sum(), m["import"].sum(),
                (m["ecrete"] + m["export"]).sum()]
@@ -2926,7 +3293,9 @@ class MainWindow(QMainWindow):
             f"<b>{d['utile']:.1f} kWh utiles</b><br>"
             f"Energie restituee : {f(d['decharge'].sum() / k['n_years'])} kWh/an &bull; "
             f"<b>{k['cycles_batterie_an']:.0f} cycles pleins/an</b> &bull; "
-            f"duree de vie estimee {6000 / max(k['cycles_batterie_an'], 1):.0f} ans<br>"
+            f"duree de vie estimee "
+            f"{self._opt(S.duree_vie_batterie_ans(k['cycles_batterie_an']), '{:.0f} ans', 'non calculable')}"
+            f"<br>"
             f"Etat de charge minimal atteint : {d['soc'].min():.1f} kWh &bull; "
             f"maximal {d['soc'].max():.1f} kWh<br>"
             f"<b>Reseau</b> : soutirage {f(k['import_an'])} kWh/an &bull; "
@@ -2964,35 +3333,84 @@ class MainWindow(QMainWindow):
         c.draw()
 
     def show_eco(self):
+        """Bilan a deux perimetres.
+
+        Colonne de gauche : l'installation solaire seule, comparee a la meme
+        maison sans panneaux ni batterie. Colonne de droite : le projet
+        complet, compare a la facture d'energie declaree avant travaux.
+        Le premier couple sert a dimensionner, le second a budgeter.
+        """
         e = self.res["eco"]; k = self.res["kpi"]
         f = lambda v, n=0: f"{v:,.{n}f}".replace(",", " ")
         horizon = int(self.cfg["economie"]["duree_analyse_ans"])
+        prix = float(self.cfg["economie"]["prix_kwh_achat"])
+        marge = e["lcoe_kwh_utile"] is not None and e["lcoe_kwh_utile"] < prix
+
         self.txt_eco.setHtml(
-            f"<table cellpadding=3>"
-            f"<tr><td>Investissement total</td><td align=right><b>{f(e['capex'])} EUR</b>"
-            f"</td><td>{e['cout_par_wc']:.2f} EUR/Wc</td></tr>"
-            f"<tr><td>Facture actuelle declaree</td><td align=right>"
-            f"{f(e['facture_actuelle'])} EUR/an</td><td></td></tr>"
-            f"<tr><td>Cout annuel tout-electrique SANS PV</td><td align=right>"
-            f"{f(e['cout_annuel_sans_pv'])} EUR/an</td><td></td></tr>"
-            f"<tr><td>Cout annuel AVEC PV et batterie</td><td align=right><b>"
-            f"{f(e['cout_annuel_avec_pv'])} EUR/an</b></td>"
-            f"<td>dont bois {f(e['cout_bois'])} EUR ({e['steres']:.1f} steres)</td></tr>"
-            f"<tr><td>Economie vs facture actuelle</td><td align=right><b>"
-            f"{f(e['economie_vs_actuel'])} EUR/an</b></td>"
-            f"<td>retour {self._retour_txt(e['retour_ans_vs_actuel'])} ans</td></tr>"
-            f"<tr><td>Economie vs tout-electrique sans PV</td><td align=right>"
-            f"{f(e['economie_vs_sans_pv'])} EUR/an</td>"
-            f"<td>retour {self._retour_txt(e['retour_ans_vs_sans_pv'])} ans</td></tr>"
-            f"<tr><td>Gain cumule a {horizon} ans</td><td align=right><b>"
-            f"{f(e['gain_cumule_horizon'])} EUR</b></td><td></td></tr>"
-            f"<tr><td>Cout du kWh autoproduit utilise</td><td align=right>"
-            f"{e['lcoe_kwh_utile']:.3f} EUR/kWh</td>"
-            f"<td>reseau : {self.cfg['economie']['prix_kwh_achat']:.3f} EUR/kWh</td></tr>"
-            f"<tr><td>Energie perdue faute d'usage</td><td align=right>"
-            f"{f(e['kwh_perdus_an'])} kWh/an</td>"
+            f"<table cellpadding=4 width='100%'>"
+            f"<tr><th align=left></th>"
+            f"<th align=right style='color:{BLEU}'>Installation solaire</th>"
+            f"<th align=right style='color:#64748b'>Projet complet</th>"
+            f"<th align=left></th></tr>"
+
+            f"<tr><td>Investissement</td>"
+            f"<td align=right><b>{f(e['capex_solaire'])} EUR</b></td>"
+            f"<td align=right>{f(e['capex_total'])} EUR</td>"
+            f"<td>{e['cout_par_wc']:.2f} EUR/Wc sur le perimetre solaire</td></tr>"
+
+            f"<tr><td>Economie annuelle</td>"
+            f"<td align=right><b>{f(e['economie_vs_sans_pv'])} EUR/an</b></td>"
+            f"<td align=right>{f(e['economie_vs_actuel'])} EUR/an</td>"
+            f"<td>solaire : {f(e['kwh_evites_an'])} kWh/an non achetes</td></tr>"
+
+            f"<tr><td>Temps de retour</td>"
+            f"<td align=right><b>{self._retour_txt(e['retour_ans_vs_sans_pv'])} ans</b></td>"
+            f"<td align=right>{self._retour_txt(e['retour_ans_vs_actuel'])} ans</td>"
+            f"<td>inflation energie "
+            f"{100 * float(self.cfg['economie']['inflation_energie']):.1f} %/an</td></tr>"
+
+            f"<tr><td>Gain cumule a {horizon} ans</td>"
+            f"<td align=right><b>{f(e['gain_cumule_solaire'])} EUR</b></td>"
+            f"<td align=right>{f(e['gain_cumule_projet'])} EUR</td>"
+            f"<td></td></tr>"
+
+            f"<tr><td colspan=4><hr></td></tr>"
+
+            f"<tr><td>Cout annuel d'energie AVEC PV</td>"
+            f"<td align=right colspan=2><b>{f(e['cout_annuel_avec_pv'])} EUR/an</b></td>"
+            f"<td>dont bois {f(e['cout_bois'])} EUR "
+            f"({e['steres']:.1f} steres)</td></tr>"
+            f"<tr><td>La meme maison SANS PV ni batterie</td>"
+            f"<td align=right colspan=2>{f(e['cout_annuel_sans_pv'])} EUR/an</td>"
+            f"<td>memes equipements, meme bois</td></tr>"
+            f"<tr><td>Facture declaree avant travaux</td>"
+            f"<td align=right colspan=2>{f(e['facture_actuelle'])} EUR/an</td>"
+            f"<td>reference du projet complet</td></tr>"
+
+            f"<tr><td colspan=4><hr></td></tr>"
+
+            f"<tr><td>Cout du kWh que le solaire evite d'acheter</td>"
+            f"<td align=right colspan=2><b>"
+            f"{self._opt(e['lcoe_kwh_utile'], '{:.3f} EUR/kWh')}</b></td>"
+            f"<td>reseau : {prix:.3f} EUR/kWh"
+            + (f" &mdash; <span style='color:{VERT if marge else ROUGE}'>"
+               f"{'moins cher que le reseau' if marge else 'plus cher que le reseau'}"
+               f"</span>" if e['lcoe_kwh_utile'] is not None else
+               " &mdash; l'installation ne couvre aucun besoin")
+            + f"</td></tr>"
+            f"<tr><td>Cout du kWh de batterie installe</td>"
+            f"<td align=right colspan=2>{f(e['cout_par_kwh_batterie'])} EUR/kWh</td>"
+            f"<td>modules et onduleurs : "
+            f"{e['cout_pv_par_wc']:.2f} EUR/Wc</td></tr>"
+            f"<tr><td>Energie perdue faute d'usage</td>"
+            f"<td align=right colspan=2>{f(e['kwh_perdus_an'])} kWh/an</td>"
             f"<td>soit {f(e['valeur_perdue_an'])} EUR/an de valeur potentielle</td></tr>"
-            f"</table>")
+            f"</table>"
+            f"<p style='color:#64748b'><i>Colonne de gauche : ce que les "
+            f"panneaux, l'onduleur et la batterie coutent et rapportent, a "
+            f"maison inchangee. C'est elle qui doit guider le dimensionnement. "
+            f"Colonne de droite : le projet entier, chauffe-eau, insert et "
+            f"isolation compris, face a la facture d'avant travaux.</i></p>")
 
     # ======================= balayages =======================
     def run_sweep(self):
@@ -3023,9 +3441,17 @@ class MainWindow(QMainWindow):
             f"<b>Production :</b> {sel['production']:.0f} kWh/an<br>"
             f"<b>Import reseau :</b> {sel['import']:.0f} kWh/an<br>"
             f"<b>Ecrete :</b> {sel['ecrete']:.0f} kWh/an<br>"
-            f"<b>Investissement :</b> {sel['capex']:.0f} EUR<br>"
-            f"<b>Retour :</b> {self._retour_txt(sel['retour'])} ans<br>"
-            f"<b>ROI marginal :</b> {sel['rentabilite_marginale']:.3f}"
+            f"<b>Cout de l'installation solaire :</b> {sel['capex']:.0f} EUR"
+            f" &nbsp;({sel.get('cout_par_wc', 0):.2f} EUR/Wc)<br>"
+            f"<b>Retour de l'installation solaire :</b> "
+            f"{self._retour_txt(sel['retour'])} ans<br>"
+            f"<b>Economie annuelle imputable au solaire :</b> "
+            f"{sel.get('economie_vs_sans_pv', 0):.0f} EUR/an<br>"
+            f"<b>ROI marginal :</b> {self._opt(sel['rentabilite_marginale'])}"
+            f"<br><span style='color:#64748b'>Projet complet "
+            f"{sel.get('capex_total', sel['capex']):.0f} EUR, dont "
+            f"{sel.get('capex_hors_solaire', 0):.0f} EUR hors perimetre solaire "
+            f"(inchanges pendant le balayage).</span>"
         )
         lab = QLabel(html)
         lay.addWidget(lab)
@@ -3063,7 +3489,8 @@ class MainWindow(QMainWindow):
         ax4.text(0.02, 0.60, f"Production : {sel['production']:.0f} kWh/an", va="top")
         ax4.text(0.02, 0.45, f"Import : {sel['import']:.0f} kWh/an", va="top")
         ax4.text(0.02, 0.30, f"Ecrete : {sel['ecrete']:.0f} kWh/an", va="top")
-        ax4.text(0.02, 0.15, f"ROI marginal : {sel['rentabilite_marginale']:.3f}", va="top")
+        ax4.text(0.02, 0.15,
+                 f"ROI marginal : {self._opt(sel['rentabilite_marginale'])}", va="top")
 
         mens = lambda i: MOIS[i]
         for a, lab, vals, unite, dec, col in (
@@ -3084,24 +3511,366 @@ class MainWindow(QMainWindow):
         lay.addWidget(btn_box)
         dlg.exec()
 
+    def _build_grille(self):
+        """Recherche d'optimum a deux dimensions.
+
+        Panneaux et batterie ne se dimensionnent pas l'un apres l'autre :
+        des panneaux sans batterie produisent un surplus qu'on jette, une
+        batterie sans panneaux n'a rien a stocker. Il faut la grille.
+        """
+        w = QWidget(); lay = QVBoxLayout(w)
+        intro = QLabel(
+            "<b>Quel couple puissance PV / capacite batterie choisir ?</b> "
+            "Chaque combinaison est reellement simulee sur toute la serie "
+            "meteo. Le <i>chemin de croissance</i>, a gauche, donne l'ordre "
+            "dans lequel agrandir l'installation et s'arrete des que la "
+            "tranche suivante depasse le seuil de rentabilite fixe dans la "
+            "barre du haut.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet("background:#f1f5f9;padding:6px;border-radius:4px;")
+        lay.addWidget(intro)
+
+        row = QHBoxLayout()
+        aide_liste = ("<b>Valeurs a tester.</b><br>"
+                      "Liste separee par des virgules, ou intervalle au format "
+                      "<i>debut:fin@pas</i>. Exemple : <i>10:40@5</i> teste "
+                      "10, 15, 20, 25, 30, 35 et 40.<br>"
+                      "Commencez le plus bas possible : c'est la premiere "
+                      "tranche qui est la plus rentable, et il faut la voir.")
+        lab1 = QLabel("Puissances PV (kWc) :")
+        self.ed_grille_kwc = QLineEdit("5:40@5")
+        lab2 = QLabel("Capacites batterie (kWh) :")
+        self.ed_grille_batt = QLineEdit("0:128@16")
+        for lab, ed in ((lab1, self.ed_grille_kwc), (lab2, self.ed_grille_batt)):
+            lab.setToolTip(aide_liste); ed.setToolTip(aide_liste)
+            ed.setMaximumWidth(150)
+            ed.textChanged.connect(self._maj_taille_grille)
+            row.addWidget(lab); row.addWidget(ed)
+
+        lab3 = QLabel("Critere :")
+        self.cb_grille_critere = QComboBox()
+        for cle, (libelle, _sens, _u, _d, aide) in S.CRITERES_GRILLE.items():
+            self.cb_grille_critere.addItem(libelle, cle)
+        self.cb_grille_critere.setToolTip(
+            "<b>Sur quoi juge-t-on le meilleur couple ?</b><br><br>"
+            + "<br><br>".join(
+                f"<b>{lib}</b> : {aide}"
+                for lib, _s, _u, _d, aide in S.CRITERES_GRILLE.values()))
+        self.cb_grille_critere.setCurrentIndex(0)
+        self.cb_grille_critere.currentIndexChanged.connect(
+            lambda *_: self.show_grille() if getattr(self, "_grille_res", None)
+            else None)
+        row.addWidget(lab3); row.addWidget(self.cb_grille_critere)
+
+        self.btn_grille = QPushButton("Chercher l'optimum")
+        self.btn_grille.setToolTip(
+            "Simule toutes les combinaisons. Une simulation dure environ "
+            "un dixieme de seconde : une grille de 60 points prend quelques "
+            "secondes.")
+        self.btn_grille.clicked.connect(self.run_grille)
+        row.addWidget(self.btn_grille)
+        self.lbl_taille_grille = QLabel("")
+        row.addWidget(self.lbl_taille_grille)
+        row.addStretch(1)
+        lay.addLayout(row)
+
+        self.lbl_grille = QLabel(
+            "Lancez la recherche pour voir par quoi commencer et jusqu'ou aller.")
+        self.lbl_grille.setWordWrap(True)
+        self.lbl_grille.setStyleSheet(
+            "background:#fff7ed;padding:7px;border-radius:4px;")
+        lay.addWidget(self.lbl_grille)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self.tbl_grille = table(
+            ["Etape", "kWc", "Batterie (kWh)", "Cout cumule (EUR)",
+             "Cout de l'etape (EUR)", "Gain de l'etape (EUR/an)",
+             "Retour de l'etape (ans)", "Autonomie"],
+            tips=["Ce que l'on ajoute a cette etape. L'ordre est celui du "
+                  "meilleur rapport : a chaque fois, la tranche qui se "
+                  "rembourse le plus vite entre un cran de panneaux et un "
+                  "cran de batterie.",
+                  "Puissance crete totale apres cette etape.",
+                  "Capacite nominale totale apres cette etape.",
+                  "Investissement solaire cumule depuis le point de depart.",
+                  "Ce que coute cette seule etape.",
+                  "Euros economises en plus chaque annee grace a cette seule "
+                  "etape.",
+                  "<b>Annees pour que cette etape se rembourse toute seule.</b><br>"
+                  "C'est le critere d'arret : la recherche s'arrete des que "
+                  "la meilleure etape suivante depasse le seuil.",
+                  "Taux d'autonomie annuel atteint apres cette etape."])
+        split.addWidget(self.tbl_grille)
+
+        self.cv_grille = MplCanvas(7, 4)
+        self.cv_grille.setToolTip(
+            "<b>Carte du critere choisi.</b> Chaque case est une simulation "
+            "complete. La croix marque l'optimum, la ligne blanche le chemin "
+            "de croissance etape par etape." + HINT)
+        self.cv_grille.set_plot(self.draw_grille, "Optimum PV x batterie")
+        split.addWidget(self.cv_grille)
+        split.setSizes([620, 720])
+        lay.addWidget(split, 1)
+        self._grille_res = None
+        self._maj_taille_grille()
+        return w
+
+    def _maj_taille_grille(self, *_):
+        """Annonce le nombre de simulations avant de les lancer."""
+        try:
+            nk = len(S.parse_sweep_values(self.ed_grille_kwc.text()))
+            nb = len(S.parse_sweep_values(self.ed_grille_batt.text()))
+        except ValueError as exc:
+            self.lbl_taille_grille.setText(
+                f"<span style='color:{ROUGE}'>{exc}</span>")
+            return
+        n = nk * nb
+        self.lbl_taille_grille.setText(
+            f"{nb} x {nk} = <b>{n} simulations</b>, environ "
+            f"{max(n * 0.1, 0.5):.0f} s")
+
+    def run_grille(self):
+        if self.meteo is None:
+            self.statusBar().showMessage("Chargez d'abord une serie meteo.", 4000)
+            return
+        self.pull_config()
+        try:
+            kwc = S.parse_sweep_values(self.ed_grille_kwc.text())
+            batt = S.parse_sweep_values(self.ed_grille_batt.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "Valeurs", str(exc))
+            return
+        if len(kwc) < 2 or len(batt) < 2:
+            QMessageBox.warning(
+                self, "Valeurs",
+                "Il faut au moins deux puissances et deux capacites pour "
+                "qu'une grille ait un sens.")
+            return
+        if S.total_kwc(self.cfg) <= 0:
+            QMessageBox.warning(
+                self, "Champs PV",
+                "Aucun panneau actif : la mise a l'echelle de la puissance "
+                "n'a pas de point de depart. Renseignez l'onglet 2.")
+            return
+        self._start(Worker(S.grille_dimensionnement, self.cfg, self.meteo,
+                           kwc, batt),
+                    self._grille_prete, "Recherche de l'optimum")
+
+    def _grille_prete(self, res):
+        self._grille_res = res
+        self.show_grille()
+        self.statusBar().showMessage(
+            f"{len(res['batt']) * len(res['kwc'])} combinaisons simulees.", 8000)
+
+    def show_grille(self):
+        g = getattr(self, "_grille_res", None)
+        if not g:
+            return
+        seuil = float(self.sp_seuil_tranche.value())
+        chemin = S.chemin_croissance(g, seuil_ans=seuil)
+        self._grille_chemin = chemin
+        f = lambda v, n=0: "-" if v is None else f"{v:,.{n}f}".replace(",", " ")
+
+        t = self.tbl_grille
+        etapes = chemin["etapes"]
+        t.setRowCount(len(etapes))
+        for r, e in enumerate(etapes):
+            t.setItem(r, 0, item(e["quoi"], bold=(r == len(etapes) - 1)))
+            t.setItem(r, 1, item(f"{e['kwc']:.1f}", align_right=True))
+            t.setItem(r, 2, item(f"{e['batt']:.0f}", align_right=True))
+            t.setItem(r, 3, item(f(e["capex"]), align_right=True))
+            t.setItem(r, 4, item(f(e["cout_tranche"]), align_right=True))
+            t.setItem(r, 5, item(f(e["gain_tranche"]), align_right=True))
+            ret = e["retour_tranche"]
+            it = item("-" if ret is None else f"{ret:.1f}", align_right=True,
+                      bold=True)
+            if ret is not None:
+                it.setForeground(QColor(VERT if ret <= seuil * .6 else
+                                        ORANGE if ret <= seuil else ROUGE))
+            t.setItem(r, 6, it)
+            t.setItem(r, 7, item(f"{100 * e['autonomie']:.1f} %", align_right=True))
+
+        d = etapes[-1]
+        m = g["matrices"]
+        critere = self.cb_grille_critere.currentData()
+        i_opt, j_opt = S.optimum_grille(g, critere, seuil)
+        lib_crit = S.CRITERES_GRILLE[critere][0]
+        txt = [
+            f"<b>En s'arretant des qu'une tranche met plus de {seuil:.0f} ans "
+            f"a se rembourser : {d['kwc']:.1f} kWc et {d['batt']:.0f} kWh</b>, "
+            f"soit {f(d['capex'])} EUR et {100 * d['autonomie']:.1f} % "
+            f"d'autonomie, en {len(etapes) - 1} etape(s)."]
+        if chemin["arret"]:
+            txt.append(f"Pourquoi s'arreter la : {chemin['arret']}")
+        txt.append(
+            f"<b>Critere \"{lib_crit}\"</b> : {g['kwc'][j_opt]:.1f} kWc et "
+            f"{g['batt'][i_opt]:.0f} kWh &mdash; {f(m['capex'][i_opt, j_opt])} EUR, "
+            f"{100 * m['autonomie'][i_opt, j_opt]:.1f} % d'autonomie, retour "
+            f"{f(m['retour'][i_opt, j_opt], 1)} ans, gain cumule "
+            f"{f(m['gain'][i_opt, j_opt])} EUR sur {g['horizon']} ans.")
+        txt.append(
+            "<i>Le chemin de croissance et l'optimum du critere ne coincident "
+            "pas forcement : le premier refuse toute tranche trop lente, le "
+            "second regarde le resultat final. L'ecart entre les deux, c'est "
+            "ce que vous payez pour du confort plutot que pour de la "
+            "rentabilite.</i>")
+        self.lbl_grille.setText("<br>".join(txt))
+        self.draw_grille()
+
+    def draw_grille(self, cv=None):
+        g = getattr(self, "_grille_res", None)
+        c = self._cv(cv, self.cv_grille); c.clear()
+        if not g:
+            ax = c.fig.add_subplot(111)
+            ax.text(.5, .5, "Lancez la recherche d'optimum.", ha="center",
+                    va="center", fontsize=9, color="#94a3b8")
+            ax.set_xticks([]); ax.set_yticks([])
+            c.draw(); return
+
+        critere = self.cb_grille_critere.currentData()
+        libelle, sens, unite, dec, _aide = S.CRITERES_GRILLE[critere]
+        m = g["matrices"]
+        cle = {"gain": "gain", "retour": "retour", "cout_kwh": "cout_kwh",
+               "autonomie": "autonomie",
+               "autonomie_sous_seuil": "autonomie"}[critere]
+        z = np.array(m[cle], dtype=float)
+        facteur = 100.0 if cle == "autonomie" else 1.0
+        z = z * facteur
+        x = np.array(g["kwc"], dtype=float)
+        y = np.array(g["batt"], dtype=float)
+
+        ax = c.fig.add_subplot(111)
+        im = ax.pcolormesh(x, y, z, shading="nearest",
+                           cmap="viridis" if sens > 0 else "viridis_r")
+        cb = c.fig.colorbar(im, ax=ax)
+        cb.set_label(f"{libelle} ({unite})", fontsize=7)
+        cb.ax.tick_params(labelsize=6)
+
+        chemin = getattr(self, "_grille_chemin", None)
+        if chemin:
+            px = [e["kwc"] for e in chemin["etapes"]]
+            py = [e["batt"] for e in chemin["etapes"]]
+            ax.plot(px, py, color="white", lw=2.4, marker="o", ms=5,
+                    markerfacecolor="white", markeredgecolor="#0f172a",
+                    label="Chemin de croissance")
+            ax.plot(px[-1:], py[-1:], marker="o", ms=11, mew=2.2,
+                    markerfacecolor="none", markeredgecolor="#0f172a")
+
+        seuil = float(self.sp_seuil_tranche.value())
+        i_opt, j_opt = S.optimum_grille(g, critere, seuil)
+        ax.plot([x[j_opt]], [y[i_opt]], marker="x", ms=15, mew=3.5, color="white")
+        ax.plot([x[j_opt]], [y[i_opt]], marker="x", ms=12, mew=2.0, color=ROUGE,
+                label=f"Optimum : {libelle.lower()}")
+
+        ax.set_xlabel("Puissance crete installee (kWc)")
+        ax.set_ylabel("Capacite batterie (kWh)")
+        ax.set_title(f"{libelle} selon le couple panneaux / batterie", fontsize=9)
+        ax.legend(fontsize=7, frameon=True, framealpha=.85, loc="lower right")
+        c.hover2d(ax, x, y, z,
+                  ("Puissance (kWc)", "Batterie (kWh)", libelle, unite, dec),
+                  titre="Couple panneaux / batterie")
+        c.draw()
+
+    def _cell_retour_tranche(self, o):
+        """Cellule coloree du temps de retour d'une tranche seule.
+
+        Vert : la tranche se paie vite. Orange : elle se paie, mais tard.
+        Rouge : elle ne se paiera pas. C'est le feu tricolore du "j'en
+        ajoute un de plus ou j'arrete la ?".
+        """
+        statut = o.get("statut", "depart")
+        horizon = int(self.cfg["economie"].get("duree_analyse_ans", 25))
+        r = o.get("retour_tranche")
+        if statut == "depart":
+            txt, coul, tip = "-", None, "Premiere valeur testee : rien avant elle."
+        elif statut == "sans_surcout":
+            txt, coul, tip = "-", None, ("Cette option ne coute rien de plus : "
+                                         "il n'y a rien a amortir.")
+        elif statut == "gratuit":
+            txt, coul, tip = "immediat", VERT, ("Aucun surcout et un gain "
+                                                "annuel : a prendre sans reflechir.")
+        elif statut == "jamais":
+            txt, coul, tip = "jamais", ROUGE, (
+                "Cette tranche coute et ne rapporte rien de plus, ou fait "
+                "perdre. Ne l'achetez pas : arretez-vous a la ligne "
+                "precedente.")
+        elif statut == "trop_long":
+            txt, coul, tip = f"> {horizon}", ROUGE, (
+                f"Cette tranche finirait par se rembourser, mais apres les "
+                f"{horizon} ans d'horizon d'analyse. Le materiel sera "
+                f"probablement remplace avant.")
+        else:
+            txt = f"{r:.1f}"
+            coul = VERT if r <= 8 else (ORANGE if r <= 15 else ROUGE)
+            tip = (f"Cette tranche se rembourse toute seule en {r:.1f} ans, "
+                   f"quelle que soit la rentabilite des precedentes.")
+        it = item(txt, align_right=True, bold=True, tip=tip)
+        if coul:
+            it.setForeground(QColor(coul))
+        return it
+
+    @staticmethod
+    def _optimums(out):
+        """(indice de l'autonomie maximale, indice du meilleur gain cumule).
+
+        Le second est le seul qui sache s'arreter : l'autonomie croit avec la
+        taille du champ et de la batterie, donc la designer comme optimum
+        revient a toujours recommander la plus grande valeur saisie.
+        """
+        best = max(range(len(out)), key=lambda i: out[i]["autonomie"])
+        gains = [o.get("gain_cumule_solaire") for o in out]
+        if any(g is not None for g in gains):
+            best_eco = max(range(len(out)),
+                           key=lambda i: (gains[i] if gains[i] is not None
+                                          else float("-inf")))
+        else:
+            best_eco = None
+        return best, best_eco
+
     def show_sweep(self, var, out):
         if not out:
             return
         t = self.tbl_sweep; t.setRowCount(len(out))
         f = lambda v, n=0: f"{v:,.{n}f}".replace(",", " ")
-        best = max(range(len(out)), key=lambda i: out[i]["autonomie"])
+        best, best_eco = self._optimums(out)
         for r, o in enumerate(out):
-            t.setItem(r, 0, item(f"{o['valeur']:g}", bold=(r == best)))
+            it0 = item(f"{o['valeur']:g}", bold=(r == best))
+            if r == best_eco and best_eco != best:
+                it0.setForeground(QColor(VERT))
+                it0.setToolTip("Meilleur gain cumule sur l'horizon d'analyse, "
+                               "perimetre solaire : au-dela, chaque euro "
+                               "supplementaire rapporte moins qu'il ne coute.")
+            t.setItem(r, 0, it0)
             t.setItem(r, 1, item(f"{100 * o['autonomie']:.2f} %", align_right=True,
                                  bold=(r == best)))
             for c, key in enumerate(["production", "import", "ecrete", "capex"], start=2):
                 t.setItem(r, c, item(f(o[key]), align_right=True))
-            t.setItem(r, 6, item(self._retour_txt(o["retour"]), align_right=True))
-            t.setItem(r, 7, item(f"{o['rentabilite_marginale']:.3f}", align_right=True))
+            t.setItem(r, 6, item(f"{o.get('cout_par_wc', 0):.2f}", align_right=True))
+            t.setItem(r, 7, item(self._retour_txt(o["retour"]), align_right=True))
+
+            # --- les quatre colonnes de la tranche ---
+            dv = o.get("delta_valeur")
+            t.setItem(r, 8, item("-" if dv is None else f"{dv:+g}", align_right=True))
+            t.setItem(r, 9, item(self._opt(o.get("cout_tranche"), "{:,.0f}")
+                                 .replace(",", " "), align_right=True))
+            t.setItem(r, 10, item(self._opt(o.get("gain_tranche"), "{:,.0f}")
+                                  .replace(",", " "), align_right=True))
+            t.setItem(r, 11, self._cell_retour_tranche(o))
+
+            roi = o["rentabilite_marginale"]
+            it_roi = item(self._opt(roi), align_right=True)
+            if roi is None and r > 0:
+                it_roi.setToolTip(
+                    "Cette option ne coute pas un euro de plus que la "
+                    "precedente (une inclinaison ou un azimut ne change pas "
+                    "la nomenclature) : le rapport gain/surcout n'a pas de "
+                    "sens ici. Comparez directement l'autonomie.")
+            t.setItem(r, 12, it_roi)
         self._sweep_out, self._sweep_var = out, var
         self._sweep_libelle = self.cb_sweep.currentText()
         self.draw_sweep()
         self.draw_sweep_bar()
+        self.draw_sweep_tranche()
         self.tabs.setCurrentIndex(6)
 
     def draw_sweep(self, cv=None):
@@ -3143,8 +3912,16 @@ class MainWindow(QMainWindow):
         ax3.set_ylabel("Import reseau (kWh/mois)")
         ax3.set_title("Energie importee du reseau")
         ax3.grid(alpha=.25, ls=":")
-        ax4.plot(x, [o["rentabilite_marginale"] for o in out], marker="o", lw=2,
-                 color="#16a34a", label="ROI marginal")
+        # None = pas de surcout entre deux options (balayage d'inclinaison) :
+        # np.nan laisse un trou dans la courbe au lieu d'un faux zero.
+        roi = np.array([np.nan if o["rentabilite_marginale"] is None
+                        else o["rentabilite_marginale"] for o in out], dtype=float)
+        ax4.plot(x, roi, marker="o", lw=2, color="#16a34a", label="ROI marginal")
+        if np.all(np.isnan(roi)):
+            ax4.text(0.5, 0.5, "Ce balayage ne change pas la nomenclature :\n"
+                               "aucun surcout a rentabiliser.",
+                     ha="center", va="center", fontsize=7.5, color="#64748b",
+                     transform=ax4.transAxes)
         ax4.axhline(0, color="black", lw=0.5, alpha=0.35)
         ax4.set_title("ROI marginal / unite supplementaire")
         ax4.set_xlabel(libelle)
@@ -3157,9 +3934,14 @@ class MainWindow(QMainWindow):
                 ax.legend(loc="upper left", fontsize=6.5, frameon=False,
                           ncol=2 if len(out) > 6 else 1, title=libelle,
                           title_fontsize=6.5)
-        best = max(range(len(out)), key=lambda i: out[i]["autonomie"])
-        fig.suptitle(f"Optimum : {x[best]:g} -> {100 * out[best]['autonomie']:.2f} % d'autonomie",
-                     fontsize=10, color=BLEU)
+        best, best_eco = self._optimums(out)
+        titre = (f"Autonomie maximale : {x[best]:g} "
+                 f"-> {100 * out[best]['autonomie']:.2f} %")
+        if best_eco is not None and best_eco != best:
+            titre += (f"   |   meilleur gain sur l'horizon : {x[best_eco]:g} "
+                      f"-> {100 * out[best_eco]['autonomie']:.2f} % d'autonomie "
+                      f"pour {out[best_eco]['capex']:,.0f} EUR".replace(",", " "))
+        fig.suptitle(titre, fontsize=9.5, color=BLEU)
         c.set_click_handler(lambda xdata: self.open_sweep_detail(out, xdata))
         mens = lambda i: MOIS[i]
         c.hover(ax1, np.arange(12), s_prod, xfmt=mens,
@@ -3173,9 +3955,8 @@ class MainWindow(QMainWindow):
                  ("Production", [o["production"] for o in out], "kWh/an", 0, "#d97706"),
                  ("Soutire au reseau", [o["import"] for o in out], "kWh/an", 0, "#b91c1c"),
                  ("Ecrete", [o["ecrete"] for o in out], "kWh/an", 0, "#7c3aed"),
-                 ("Investissement", [o["capex"] for o in out], "EUR", 0, "#0f172a"),
-                 ("ROI marginal", [o["rentabilite_marginale"] for o in out],
-                  "facteur", 3, "#16a34a")],
+                 ("Cout installation solaire", [o["capex"] for o in out], "EUR", 0, "#0f172a"),
+                 ("ROI marginal", roi, "facteur", 3, "#16a34a")],
                 xfmt=lambda i: f"{libelle} = {x[i]:g}", titre="Bilan annuel",
                 cumul=False)
         c.draw()
@@ -3209,7 +3990,10 @@ class MainWindow(QMainWindow):
         aut_moy = aut_mens.mean(axis=1)
         aut_min = aut_mens.min(axis=1)
         prod_mens = np.array([o["production_mensuel"] for o in out], dtype=float)
-        eco = np.array([o.get("economie_vs_actuel", 0.0) for o in out])
+        # economie imputable a la SEULE installation solaire, pour rester
+        # homogene avec "capex" et "retour" qui sont deja au perimetre solaire
+        eco = np.array([o.get("economie_vs_sans_pv",
+                              o.get("economie_vs_actuel", 0.0)) for o in out])
         retour = np.array([o["retour"] if o["retour"] else np.nan for o in out],
                           dtype=float)
         capex = np.array([o["capex"] for o in out])
@@ -3266,11 +4050,13 @@ class MainWindow(QMainWindow):
         ax4.legend(h4[0] + h4b[0], h4[1] + h4b[1], fontsize=7, frameon=False,
                    loc="lower right")
 
-        best = int(np.argmax(aut))
-        c.fig.suptitle(
-            f"Comparaison des {len(out)} options &mdash; meilleure autonomie : "
-            f"{etiq[best]} ({aut[best]:.2f} %)".replace("&mdash;", "-"),
-            fontsize=10, color=BLEU)
+        best, best_eco = self._optimums(out)
+        titre = (f"Comparaison des {len(out)} options - meilleure autonomie : "
+                 f"{etiq[best]} ({aut[best]:.2f} %)")
+        if best_eco is not None and best_eco != best:
+            titre += (f" | meilleur gain sur l'horizon : {etiq[best_eco]} "
+                      f"({aut[best_eco]:.2f} %)")
+        c.fig.suptitle(titre, fontsize=9.5, color=BLEU)
 
         series = [("Production utilisee", utile, "MWh/an", 2, "#15803d"),
                   ("Production ecretee", ecrete, "MWh/an", 2, "#7c3aed"),
@@ -3284,12 +4070,196 @@ class MainWindow(QMainWindow):
                   ("Autonomie, moyenne des mois", aut_moy, "%", 2, "#0891b2"),
                   ("Autonomie du mois le plus faible", aut_min, "%", 2, "#b91c1c"),
                   ("Economie annuelle", eco, "EUR/an", 0, "#15803d"),
-                  ("Investissement", capex, "EUR", 0, "#0f172a"),
+                  ("Cout installation solaire", capex, "EUR", 0, "#0f172a"),
                   ("Retour", retour, "ans", 1, BLEU)]
         for ax in (ax1, ax2, ax3, ax4, ax4b):
             c.hover(ax, x, series, xfmt=entete, titre="Comparaison des options",
                     cumul=False)
         c.draw()
+
+    def _seuil_change(self, *_):
+        """Le seuil ne change aucun calcul : il deplace seulement la limite
+        que la vue par tranche met en evidence."""
+        if getattr(self, "_sweep_out", None):
+            self.draw_sweep_tranche()
+        if getattr(self, "_grille_res", None):
+            self.show_grille()
+
+    def draw_sweep_tranche(self, cv=None):
+        """Chaque tranche jugee seule : ce qu'elle coute, ce qu'elle rapporte,
+        et en combien de temps elle se rembourse independamment des autres."""
+        out = getattr(self, "_sweep_out", None)
+        c = self._cv(cv, self.cv_sweep_tranche); c.clear()
+        if not out or len(out) < 2:
+            ax = c.fig.add_subplot(111)
+            ax.text(.5, .5, "Lancez un balayage d'au moins deux valeurs.\n\n"
+                            "Conseil : mettez la plus petite installation "
+                            "envisageable en premiere valeur\n"
+                            "(0 pour la batterie) : la premiere tranche sera "
+                            "chiffree elle aussi.",
+                    ha="center", va="center", fontsize=9, color="#94a3b8")
+            ax.set_xticks([]); ax.set_yticks([])
+            c.draw()
+            return
+
+        libelle = getattr(self, "_sweep_libelle", None) or self.cb_sweep.currentText()
+        horizon = int(self.cfg["economie"].get("duree_analyse_ans", 25))
+        x = np.arange(len(out))
+        etiq = [f"{o['valeur']:g}" for o in out]
+
+        def col(cle):
+            return np.array([np.nan if o.get(cle) is None else float(o[cle])
+                             for o in out], dtype=float)
+
+        cout_tr = col("cout_tranche")
+        gain_tr = col("gain_tranche")
+        retour_tr = col("retour_tranche")
+        net_tr = col("gain_net_tranche")
+        retour_cum = np.array([o["retour"] if o["retour"] else np.nan
+                               for o in out], dtype=float)
+        statuts = [o.get("statut", "depart") for o in out]
+
+        # les tranches qui ne se rembourseront pas sont portees au plafond du
+        # graphique plutot qu'absentes : c'est l'information la plus utile
+        jamais = np.array([st in ("jamais", "trop_long") for st in statuts])
+        etiq_tr = ["depart" if i == 0 else
+                   (f"+{o['delta_valeur']:g}" if o.get("delta_valeur") is not None
+                    else "-") for i, o in enumerate(out)]
+
+        # --- 1. cout et gain de chaque tranche -------------------------------
+        ax1 = c.fig.add_subplot(2, 2, 1)
+        ax1.bar(x, np.nan_to_num(cout_tr), .62, color="#0f172a",
+                label="Cout de la tranche")
+        ax1.set_ylabel("EUR")
+        ax1.set_title("Ce que coute et rapporte chaque tranche", fontsize=9)
+        ax1b = ax1.twinx()
+        ax1b.plot(x, gain_tr, color=VERT, marker="o", ms=4, lw=1.8,
+                  label="Gain annuel de la tranche")
+        ax1b.set_ylabel("EUR/an", color=VERT)
+        ax1b.tick_params(axis="y", labelcolor=VERT)
+        h1, h1b = ax1.get_legend_handles_labels(), ax1b.get_legend_handles_labels()
+        ax1.legend(h1[0] + h1b[0], h1[1] + h1b[1], fontsize=7, frameon=False,
+                   loc="upper right")
+
+        # --- 2. le graphique central : retour de la tranche vs retour cumule --
+        ax2 = c.fig.add_subplot(2, 2, 2)
+        plafond = float(np.nanmax(np.concatenate([
+            retour_tr[np.isfinite(retour_tr)] if np.any(np.isfinite(retour_tr))
+            else np.array([0.0]),
+            retour_cum[np.isfinite(retour_cum)] if np.any(np.isfinite(retour_cum))
+            else np.array([0.0]),
+            np.array([horizon])])))
+        plafond = max(plafond * 1.18, horizon * 1.18)
+        ax2.plot(x, retour_cum, color="#94a3b8", marker="s", ms=4, lw=1.6, ls="--",
+                 label="Retour de l'installation entiere")
+        ax2.plot(x, retour_tr, color=BLEU, marker="o", ms=6, lw=2.4,
+                 label="Retour de la TRANCHE seule")
+        for i in np.where(jamais)[0]:
+            ax2.plot([i], [plafond * .93], marker="x", ms=9, mew=2.4, color=ROUGE)
+        if np.any(jamais):
+            ax2.plot([], [], marker="x", ls="none", ms=8, mew=2.2, color=ROUGE,
+                     label="ne se rembourse pas")
+        ax2.axhline(horizon, color=ROUGE, ls=":", lw=1.4)
+        ax2.text(len(out) - .5, horizon, f" horizon {horizon} ans", color=ROUGE,
+                 fontsize=7, va="bottom", ha="right")
+        ax2.set_ylim(0, plafond)
+        ax2.set_ylabel("annees")
+        ax2.set_title("En combien de temps la tranche se rembourse-t-elle ?",
+                      fontsize=9)
+        ax2.legend(fontsize=7, frameon=False, loc="upper left")
+
+        # --- 3. gain net de la tranche a l'horizon ---------------------------
+        ax3 = c.fig.add_subplot(2, 2, 3)
+        couleurs = [VERT if (np.isfinite(v) and v > 0) else ROUGE for v in net_tr]
+        ax3.bar(x, np.nan_to_num(net_tr), .62, color=couleurs)
+        ax3.axhline(0, color="black", lw=.7)
+        ax3.set_ylabel("EUR")
+        ax3.set_title(f"Ce que la tranche aura rapporte, net, a {horizon} ans",
+                      fontsize=9)
+
+        for ax in (ax1, ax2, ax3):
+            ax.set_xticks(x)
+            ax.set_xticklabels([f"{e}\n{t}" for e, t in zip(etiq, etiq_tr)],
+                               fontsize=6.5,
+                               rotation=45 if len(out) > 8 else 0)
+            ax.grid(axis="y", alpha=.2, ls=":")
+        ax3.set_xlabel(libelle)
+
+        # --- 4. la conclusion, en toutes lettres -----------------------------
+        ax4 = c.fig.add_subplot(2, 2, 4)
+        ax4.axis("off")
+        for i, ligne in enumerate(self._texte_tranches(out, libelle, horizon)):
+            gras = ligne.startswith("*")
+            ax4.text(0.0, 0.96 - i * 0.115, ligne.lstrip("*"), va="top",
+                     fontsize=8.2 if gras else 7.6,
+                     fontweight="bold" if gras else "normal",
+                     color=BLEU if gras else "#334155", wrap=True,
+                     transform=ax4.transAxes)
+
+        c.fig.suptitle("Amortissement tranche par tranche - "
+                       "chaque tranche jugee independamment des precedentes",
+                       fontsize=9.5, color=BLEU)
+        series = [("Cout de la tranche", cout_tr, "EUR", 0, "#0f172a"),
+                  ("Gain annuel de la tranche", gain_tr, "EUR/an", 0, VERT),
+                  ("Retour de la tranche", retour_tr, "ans", 1, BLEU),
+                  ("Retour de l'installation entiere", retour_cum, "ans", 1, "#94a3b8"),
+                  (f"Gain net a {horizon} ans", net_tr, "EUR", 0, "#7c3aed"),
+                  ("Autonomie", np.array([100 * o["autonomie"] for o in out]),
+                   "%", 2, "#15803d")]
+        for ax in (ax1, ax1b, ax2, ax3):
+            c.hover(ax, x, series,
+                    xfmt=lambda i: f"{libelle} = {etiq[i]} ({etiq_tr[i]})",
+                    titre="Tranche", cumul=False)
+        c.draw()
+
+    def _texte_tranches(self, out, libelle, horizon):
+        """La conclusion du balayage, en francais : jusqu'ou pousser."""
+        f = lambda v: f"{v:,.0f}".replace(",", " ")
+        seuil = float(self.sp_seuil_tranche.value()) \
+            if hasattr(self, "sp_seuil_tranche") else 10.0
+        i_seuil = S.derniere_tranche_rentable(out, seuil_ans=seuil)
+        i_horizon = S.derniere_tranche_rentable(out, seuil_ans=horizon)
+        lignes = []
+
+        if i_seuil is not None and out[i_seuil].get("statut") != "depart":
+            lignes.append(f"*Tant que chaque tranche doit se payer en moins de "
+                          f"{seuil:.0f} ans :")
+            lignes.append(f"   aller jusqu'a {libelle} = {out[i_seuil]['valeur']:g}, "
+                          f"soit {f(out[i_seuil]['capex'])} EUR "
+                          f"et {100 * out[i_seuil]['autonomie']:.1f} % d'autonomie.")
+        elif i_seuil is not None:
+            lignes.append(f"*Meme la premiere tranche ne se paie pas en "
+                          f"{seuil:.0f} ans.")
+            lignes.append("   Le dimensionnement de depart est deja au-dela du "
+                          "point de rentabilite, ou le prix du kWh saisi est "
+                          "trop bas.")
+
+        if i_horizon is not None and i_horizon != i_seuil:
+            lignes.append(f"*Limite absolue, tranches remboursees avant "
+                          f"{horizon} ans :")
+            lignes.append(f"   {libelle} = {out[i_horizon]['valeur']:g}, "
+                          f"{f(out[i_horizon]['capex'])} EUR, "
+                          f"{100 * out[i_horizon]['autonomie']:.1f} % d'autonomie.")
+
+        perdues = [o for o in out if o.get("statut") in ("jamais", "trop_long")]
+        if perdues:
+            cout = sum(o["cout_tranche"] or 0.0 for o in perdues)
+            gain = sum(o["gain_tranche"] or 0.0 for o in perdues)
+            lignes.append(f"*Les {len(perdues)} dernieres tranches coutent "
+                          f"{f(cout)} EUR")
+            lignes.append(f"   et ne rapportent que {f(gain)} EUR/an a elles "
+                          f"toutes. Elles achetent du confort, pas de la "
+                          f"rentabilite.")
+        else:
+            lignes.append("*Toutes les tranches testees se remboursent.")
+            lignes.append(f"   Poussez le balayage plus loin pour trouver ou "
+                          f"cela s'arrete.")
+        lignes.append("")
+        lignes.append("Le retour cumule (courbe grise) est une moyenne : il")
+        lignes.append("reste flatteur longtemps apres que la tranche suivante")
+        lignes.append("a cesse d'etre rentable. C'est la courbe bleue qui")
+        lignes.append("dit quand s'arreter.")
+        return lignes
 
     def run_budget(self):
         if not self.res:
@@ -3337,8 +4307,54 @@ class MainWindow(QMainWindow):
             for k, v in self.res["kpi"].items():
                 w.writerow([k, round(v, 3) if isinstance(v, float) else v])
             for k, v in self.res["eco"].items():
+                if isinstance(v, dict):
+                    continue                      # ventile juste en dessous
                 w.writerow([k, round(v, 2) if isinstance(v, float) else v])
+
+            # --- nomenclature, ligne a ligne puis ventilee par categorie ---
+            lignes, recap = S.compute_bom(self.cfg)
             w.writerow([])
+            w.writerow(["Nomenclature", "Categorie", "Perimetre", "Quantite auto",
+                        "Quantite retenue", "Unite", "Prix unitaire EUR",
+                        "Montant EUR"])
+            for l in lignes:
+                w.writerow([l["poste"], C.BOM_CATEGORIES[l["categorie"]]["label"],
+                            "solaire" if l["solaire"] else "hors solaire",
+                            C.AUTO_QTY.get(l.get("auto", "fixe"), ""),
+                            round(l["qte_calc"], 2), l.get("unite", ""),
+                            round(float(l.get("pu", 0)), 2), round(l["montant"], 2)])
+            w.writerow([])
+            w.writerow(["Sous-total", "Montant EUR", "Perimetre"])
+            for k in C.ORDRE_CATEGORIES:
+                v = recap["par_categorie"].get(k, 0.0)
+                if v:
+                    w.writerow([C.BOM_CATEGORIES[k]["label"], round(v, 2),
+                                "solaire" if C.est_solaire(k) else "hors solaire"])
+            w.writerow(["PERIMETRE SOLAIRE", round(recap["solaire"], 2), "solaire"])
+            w.writerow(["Hors perimetre solaire", round(recap["hors_solaire"], 2),
+                        "hors solaire"])
+            w.writerow(["PROJET COMPLET", round(recap["total"], 2), ""])
+            w.writerow([])
+            out = getattr(self, "_sweep_out", None)
+            if out:
+                w.writerow(["Balayage", getattr(self, "_sweep_libelle", "")])
+                w.writerow(["Valeur", "Autonomie %", "Production kWh",
+                            "Import kWh", "Ecrete kWh", "Cout solaire EUR",
+                            "EUR/Wc", "Retour cumule ans", "Tranche",
+                            "Cout tranche EUR", "Gain tranche EUR/an",
+                            "Retour tranche ans", "Statut tranche"])
+                for o in out:
+                    n = lambda v, d=2: "" if v is None else round(float(v), d)
+                    w.writerow([o["valeur"], round(100 * o["autonomie"], 2),
+                                round(o["production"]), round(o["import"]),
+                                round(o["ecrete"]), round(o["capex"]),
+                                round(o.get("cout_par_wc", 0), 3),
+                                n(o["retour"], 2), n(o.get("delta_valeur"), 3),
+                                n(o.get("cout_tranche"), 0),
+                                n(o.get("gain_tranche"), 0),
+                                n(o.get("retour_tranche"), 2),
+                                o.get("statut", "")])
+                w.writerow([])
             w.writerow(["Jour", "Production", "Consommation", "Besoin", "Import", "Autonomie %"])
             j = self.res["journalier"]
             for i in range(len(j["date"])):

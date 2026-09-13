@@ -3,9 +3,11 @@ Moteur de simulation : production des champs, gestion onduleur / batterie
 au pas horaire, agregations jour et mois, bilan economique.
 """
 from __future__ import annotations
+import math
 import re
 import numpy as np
 
+from .config import BOM_CATEGORIES, ORDRE_CATEGORIES, est_solaire
 from .solar import field_dc_power
 from .loads import build_load
 
@@ -21,7 +23,7 @@ def compute_production(cfg: dict, meteo: dict):
     albedo = float(cfg["site"].get("albedo", 0.20))
     total = np.zeros(meteo["n"])
     par_champ, diags = {}, {}
-    for ch in cfg["champs"]:
+    for i, ch in enumerate(cfg["champs"]):
         if not ch.get("actif", True):
             continue
         kwc = float(ch["n_panneaux"]) * float(ch["wc_panneau"]) / 1000.0
@@ -30,12 +32,22 @@ def compute_production(cfg: dict, meteo: dict):
         p, poa, d = field_dc_power(meteo, kwc, float(ch["inclinaison"]),
                                    float(ch.get("azimut", 180.0)), module,
                                    albedo, float(ch.get("ombrage_pct", 0.0)))
-        par_champ[ch["nom"]] = p
+        # Rien n'impose que deux groupes portent des noms differents, et
+        # l'interface en fabrique naturellement des doublons. Sans ce
+        # desambiguisation, le detail par groupe perdait tout sauf le dernier.
+        nom = ch["nom"]
+        if nom in par_champ:
+            nom = f"{nom} ({i + 1})"
+        par_champ[nom] = p
         d["kwc"] = kwc
         d["production_kwh_an"] = float(p.sum() / meteo["n_years"])
-        diags[ch["nom"]] = d
+        diags[nom] = d
         total += p
     return total, par_champ, diags
+
+
+#: energie d'un pack 16S de cellules LFP 314 Ah : 16 x 3,2 V x 314 Ah
+KWH_PAR_PACK_16S = 16.07
 
 
 def total_kwc(cfg: dict) -> float:
@@ -67,7 +79,13 @@ def string_diag(cfg: dict, champ: dict) -> dict:
     sous la tension DC maximale de l'onduleur.
     """
     n_pan = max(int(champ.get("n_panneaux", 0)), 0)
+    # On ne peut pas cabler en serie plus de panneaux qu'il n'y en a : sans
+    # cette borne, 4 panneaux declares "par 13" affichaient une tension de
+    # grappe de 704 V, coloree en vert parce qu'elle passait sous les 800 V
+    # de l'onduleur, pour une grappe qui n'existe pas.
     n_ser = max(int(champ.get("n_serie", 0) or 0), 1)
+    if n_pan:
+        n_ser = min(n_ser, n_pan)
     voc = float(champ.get("voc_v", 0.0))
     isc = float(champ.get("isc_a", 0.0))
     beta = float(cfg["module"].get("beta_voc_pct_k", -0.27)) / 100.0
@@ -180,14 +198,22 @@ def dispatch(pv_dc: np.ndarray, load_ac: np.ndarray, meteo: dict, sys: dict):
     hours = meteo["hour"]
 
     soc = np.empty(n)
-    imp = np.zeros(n)
+    imp = np.zeros(n)            # achat total au reseau (c'est la facture)
+    imp_charges = np.zeros(n)    # dont : reseau qui alimente directement la maison
+    imp_batterie = np.zeros(n)   # dont : reseau qui remplit la batterie en HC
     exp = np.zeros(n)
     ecrete_ac = np.zeros(n)      # bride par la puissance nominale onduleur
     charge = np.zeros(n)
     decharge = np.zeros(n)
+    decharge_reseau = np.zeros(n)   # part de la decharge d'origine RESEAU
     non_servi = np.zeros(n)      # depassement de la puissance souscrite
 
     s = soc_min + float(sys.get("soc_initial", 0.5)) * utile
+    # Energie d'origine reseau presente dans la batterie, aux bornes. Sans
+    # ce suivi, l'energie achetee en heures creuses etait comptee une fois a
+    # l'achat puis rendue "autonome" a la restitution : l'autonomie affichee
+    # pouvait devenir negative.
+    s_reseau = 0.0
     besoin = load_ac + veille
 
     for i in range(n):
@@ -217,15 +243,22 @@ def dispatch(pv_dc: np.ndarray, load_ac: np.ndarray, meteo: dict, sys: dict):
                     ecrete_ac[i] += reste_dc * e_pv_ac - e
 
         if deficit > 1e-9:
-            # 3. Batterie vers charges
+            # 3. Batterie vers charges, dans la puissance restante de l'onduleur
             dispo = max(s - soc_min, 0.0) * e_dis * e_bt_ac
-            d = min(deficit, p_dis_max, dispo)
-            s -= d / max(e_dis * e_bt_ac, 1e-6)
+            marge_ac = max(p_ac_max - pv_vers_ac, 0.0)
+            d = min(deficit, p_dis_max, dispo, marge_ac)
+            retire = d / max(e_dis * e_bt_ac, 1e-6)
+            part_reseau = s_reseau / max(s - soc_min, 1e-9) if s > soc_min else 0.0
+            part_reseau = min(max(part_reseau, 0.0), 1.0)
+            s -= retire
+            s_reseau = max(s_reseau - retire * part_reseau, 0.0)
             decharge[i] = d
+            decharge_reseau[i] = d * part_reseau
             deficit -= d
             if deficit > 1e-9:
                 g = min(deficit, grid_max)
                 imp[i] = g
+                imp_charges[i] = g
                 non_servi[i] = deficit - g
 
         # 4. Recharge reseau optionnelle en heures creuses
@@ -237,7 +270,9 @@ def dispatch(pv_dc: np.ndarray, load_ac: np.ndarray, meteo: dict, sys: dict):
                 place = (soc_hc - s) / max(e_chg, 1e-6)
                 g = min(marge, p_chg_max, place)
                 s += g * e_chg
+                s_reseau += g * e_chg
                 imp[i] += g
+                imp_batterie[i] += g
                 charge[i] += g * e_chg
 
         soc[i] = s
@@ -245,6 +280,12 @@ def dispatch(pv_dc: np.ndarray, load_ac: np.ndarray, meteo: dict, sys: dict):
     return {
         "soc": soc, "soc_min": soc_min, "soc_max": soc_max, "utile": utile,
         "import": imp, "export": exp, "ecrete": ecrete_ac,
+        "import_charges": imp_charges, "import_batterie": imp_batterie,
+        "decharge_reseau": decharge_reseau,
+        # Besoin reellement couvert par de l'electricite achetee : le reseau
+        # qui alimente directement la maison, plus la part d'origine reseau
+        # de ce que la batterie restitue.
+        "import_effectif": imp_charges + decharge_reseau,
         "charge": charge, "decharge": decharge, "non_servi": non_servi,
         "veille": veille, "besoin_total": besoin,
     }
@@ -262,6 +303,23 @@ def _jour(arr, meteo):
     return np.bincount(meteo["day_index"], weights=arr, minlength=meteo["n_days"])
 
 
+def sys_eff_decharge(cfg: dict) -> float:
+    """Rendement total entre les bornes de la batterie et la maison."""
+    s = cfg["systeme"]
+    return float(s.get("eff_decharge", 1.0)) * float(s.get("eff_batt_ac", 1.0))
+
+
+def duree_vie_batterie_ans(cycles_an: float, cycles_total: float = 6000.0):
+    """Duree de vie en annees, ou None si la batterie ne cycle pas.
+
+    Retourner 6 000 ans quand le nombre de cycles tombe sous 1 n'informe
+    personne : mieux vaut ne rien afficher.
+    """
+    if cycles_an is None or cycles_an < 0.05:
+        return None
+    return cycles_total / cycles_an
+
+
 def simulate(cfg: dict, meteo: dict) -> dict:
     pv_dc, par_champ, diag_champs = compute_production(cfg, meteo)
     load, detail, infos = build_load(cfg, meteo)
@@ -270,8 +328,9 @@ def simulate(cfg: dict, meteo: dict) -> dict:
     ny = meteo["n_years"]
     conso = load                                  # consommation des usages
     besoin = d["besoin_total"]                    # usages + veille onduleurs
-    imp = d["import"]
-    autoconso = besoin - imp
+    imp = d["import"]                  # ce qui est achete, donc facture
+    imp_eff = d["import_effectif"]     # ce qui, dans le besoin, vient du reseau
+    autoconso = besoin - imp_eff
 
     m = {
         "production_dc": _mois(pv_dc, meteo),
@@ -279,6 +338,8 @@ def simulate(cfg: dict, meteo: dict) -> dict:
         "veille": _mois(d["veille"], meteo),
         "besoin": _mois(besoin, meteo),
         "import": _mois(imp, meteo),
+        "import_effectif": _mois(imp_eff, meteo),
+        "import_batterie": _mois(d["import_batterie"], meteo),
         "autoconso": _mois(autoconso, meteo),
         "export": _mois(d["export"], meteo),
         "ecrete": _mois(d["ecrete"], meteo),
@@ -286,7 +347,7 @@ def simulate(cfg: dict, meteo: dict) -> dict:
         "decharge": _mois(d["decharge"], meteo),
         "non_servi": _mois(d["non_servi"], meteo),
     }
-    m["autonomie"] = 1.0 - m["import"] / np.maximum(m["besoin"], 1e-9)
+    m["autonomie"] = 1.0 - m["import_effectif"] / np.maximum(m["besoin"], 1e-9)
     njours = np.array([np.unique(meteo["day_index"][meteo["month"] == k + 1]).size / ny
                        for k in range(12)])
     m["jours"] = njours
@@ -298,17 +359,20 @@ def simulate(cfg: dict, meteo: dict) -> dict:
         "consommation": _jour(conso, meteo),
         "besoin": _jour(besoin, meteo),
         "import": _jour(imp, meteo),
+        "import_effectif": _jour(imp_eff, meteo),
         "date": meteo["days"],
         "mois": meteo["month"][np.unique(meteo["day_index"], return_index=True)[1]],
         "soc_min": np.minimum.reduceat(
             d["soc"], np.unique(meteo["day_index"], return_index=True)[1]),
     }
-    jour["autonomie"] = 1.0 - jour["import"] / np.maximum(jour["besoin"], 1e-9)
+    jour["autonomie"] = 1.0 - jour["import_effectif"] / np.maximum(jour["besoin"], 1e-9)
 
     kwc = total_kwc(cfg)
     conso_an = conso.sum() / ny
     besoin_an = besoin.sum() / ny
     imp_an = imp.sum() / ny
+    imp_eff_an = imp_eff.sum() / ny
+    prod_an = float(pv_dc.sum() / ny)
 
     res = {
         "meteo": meteo, "mensuel": m, "journalier": jour,
@@ -325,14 +389,21 @@ def simulate(cfg: dict, meteo: dict) -> dict:
             "veille_an": float(d["veille"].sum() / ny),
             "besoin_an": float(besoin_an),
             "import_an": float(imp_an),
+            "import_effectif_an": float(imp_eff_an),
+            "import_batterie_an": float(d["import_batterie"].sum() / ny),
             "export_an": float(d["export"].sum() / ny),
             "ecrete_an": float(d["ecrete"].sum() / ny),
             "non_servi_an": float(d["non_servi"].sum() / ny),
-            "autonomie": float(1.0 - imp_an / max(besoin_an, 1e-9)),
-            "taux_autoconso": float((besoin_an - imp_an) /
-                                    max(pv_dc.sum() / ny, 1e-9)),
-            "cycles_batterie_an": float(d["decharge"].sum() / ny /
-                                        max(d["utile"], 1e-9)),
+            "autonomie": float(1.0 - imp_eff_an / max(besoin_an, 1e-9)),
+            "taux_autoconso": (float((besoin_an - imp_eff_an) / prod_an)
+                               if prod_an > 1e-6 else 0.0),
+            # Cycles comptes AUX BORNES de la batterie : decharge[] est une
+            # energie deja convertie en alternatif, il faut la remonter par
+            # les rendements pour la comparer a une capacite.
+            "cycles_batterie_an": (
+                float(d["decharge"].sum() / ny
+                      / max(float(sys_eff_decharge(cfg)), 1e-6)
+                      / d["utile"]) if d["utile"] > 1e-9 else 0.0),
             "conso_jour_moy": float(conso_an / 365.25),
             "conso_jour_max": float(jour["consommation"].max()),
             "jours_sans_import": int((jour["import"] < 0.5).sum() / ny),
@@ -350,9 +421,17 @@ def simulate(cfg: dict, meteo: dict) -> dict:
 # Economie
 # --------------------------------------------------------------------------
 def bom_quantities(cfg: dict) -> dict:
+    """Quantites deduites de la configuration, pour les lignes de devis
+    indexees sur le dimensionnement plutot que saisies a la main."""
     kwc = total_kwc(cfg)
     batt = float(cfg["systeme"]["batt_kwh_nominal"])
-    packs = max(int(round(batt / 16.07)), 0)
+    # Arrondi au SUPERIEUR : on n'achete pas un demi-pack, et l'arrondi au
+    # plus proche rendait une batterie de 8 kWh gratuite dans le devis
+    # (0 pack, 0 cellule, 0 BMS). La tolerance de 2 % absorbe le fait qu'une
+    # capacite se saisit arrondie : 64,3 kWh, ce sont bien 4 packs de 16,07
+    # et non 5.
+    packs = int(math.ceil(batt / KWH_PAR_PACK_16S - 0.02)) if batt > 0 else 0
+    packs = max(packs, 1 if batt > 0 else 0)
     return {
         "fixe": 1.0,
         "panneaux": float(total_panneaux(cfg)),
@@ -362,27 +441,119 @@ def bom_quantities(cfg: dict) -> dict:
         "packs": float(packs),
         "cellules": float(packs * 16),
         "m2_panneaux": surface_m2(cfg),
+        "grappes": float(round(total_grappes(cfg))),
     }
 
 
 def compute_bom(cfg: dict):
+    """Chiffre la nomenclature et la ventile par categorie.
+
+    Retourne (lignes, recap). Chaque ligne recoit sa quantite retenue, son
+    montant, sa categorie normalisee et un drapeau "solaire".
+
+    recap sepate deux perimetres, et c'est tout l'interet de la ventilation :
+
+      * "solaire"      : panneaux, structure, onduleurs, batterie, cablage,
+                         protections, pose, demarches, outillage. C'est le
+                         seul chiffre qui a un sens pour juger un
+                         dimensionnement ou comparer deux options.
+      * "hors_solaire" : chauffe-eau thermodynamique, insert, isolation.
+                         Ces postes changent la consommation simulee, donc
+                         le resultat, mais leur prix ne doit jamais peser
+                         sur l'arbitrage panneaux / onduleur / batterie.
+    """
     q = bom_quantities(cfg)
-    lignes, total = [], 0.0
-    for l in cfg["bom"]:
+    lignes = []
+    par_cat = {c: 0.0 for c in ORDRE_CATEGORIES}
+    total = solaire = 0.0
+    for l in cfg.get("bom", []):
         auto = l.get("auto", "fixe")
+        inconnue = auto not in q
+        if inconnue:
+            auto = "fixe"           # regle disparue : on retombe sur la saisie
+        # Une quantite a zero est un choix : garder au devis une option non
+        # retenue (differentiel type B, second onduleur en reserve) sans
+        # qu'elle soit facturee. L'ancienne regle la forcait a 1.
         qte = float(l.get("qte", 0)) if auto == "fixe" else q.get(auto, 0.0)
-        if auto == "fixe" and float(l.get("qte", 0)) == 0:
-            qte = 1.0
         montant = qte * float(l.get("pu", 0.0))
-        lignes.append({**l, "qte_calc": qte, "montant": montant})
+        cat = l.get("categorie")
+        if cat not in BOM_CATEGORIES:
+            cat = "divers"
+        sol = est_solaire(cat)
+        lignes.append({**l, "auto": auto, "categorie": cat, "solaire": sol,
+                       "auto_inconnue": inconnue,
+                       "qte_calc": qte, "montant": montant})
+        par_cat[cat] = par_cat.get(cat, 0.0) + montant
         total += montant
-    return lignes, total
+        if sol:
+            solaire += montant
+    recap = {
+        "total": total,
+        "solaire": solaire,
+        "hors_solaire": total - solaire,
+        "par_categorie": par_cat,
+    }
+    return lignes, recap
+
+
+def cout_categorie(recap: dict, *categories) -> float:
+    """Somme du devis sur une ou plusieurs categories.
+
+    Accepte indifferemment le recap de compute_bom() (cle "par_categorie")
+    et le dictionnaire economique de simulate() (cle "capex_par_categorie") :
+    les deux circulent dans le code et se ressemblent assez pour qu'on les
+    confonde, et renvoyer 0 en silence serait le pire des comportements.
+    """
+    pc = recap.get("par_categorie")
+    if pc is None:
+        pc = recap.get("capex_par_categorie")
+    if pc is None:
+        raise KeyError("dictionnaire sans ventilation par categorie : "
+                       "attendu 'par_categorie' ou 'capex_par_categorie'")
+    return float(sum(pc.get(c, 0.0) for c in categories))
+
+
+def _retour(capex: float, gain_an: float, infl: float, horizon: int):
+    """Temps de retour en annees, inflation de l'energie comprise.
+
+    Retourne (retour_ans_ou_None, cumul_a_l_horizon). L'annee de bascule est
+    interpolee : un retour de 6,0 annees ne veut pas dire "la 7e annee".
+    """
+    cum = -float(capex)
+    retour = 0.0 if cum >= 0 else None
+    for an in range(1, int(horizon) + 1):
+        gain = gain_an * (1.0 + infl) ** (an - 1)
+        avant = cum
+        cum += gain
+        if retour is None and cum >= 0:
+            retour = (an - 1) + (-avant / gain if gain > 1e-9 else 0.0)
+    return retour, cum
 
 
 def economics(cfg: dict, res: dict) -> dict:
+    """Bilan economique a DEUX PERIMETRES.
+
+    1. L'INSTALLATION SOLAIRE SEULE : capex_solaire face a l'energie que les
+       panneaux et la batterie evitent d'acheter, a maison inchangee. C'est
+       ce couple qui doit servir a arbitrer un panneau de plus, un pack de
+       batterie de plus, une inclinaison ou un onduleur.
+
+    2. LE PROJET COMPLET : capex_total (solaire + chauffe-eau + insert +
+       isolation) face a la facture d'energie declaree avant travaux.
+
+    Melanger les deux, comme le faisait la version precedente, donne un temps
+    de retour faux dans les deux sens : le prix d'une isolation de combles
+    alourdissait le retour de la batterie, et l'economie de chauffage
+    l'allegeait.
+    """
     e = cfg["economie"]
     k = res["kpi"]
-    _, capex = compute_bom(cfg)
+    lignes_bom, recap = compute_bom(cfg)
+    capex_solaire = recap["solaire"]
+    capex_total = recap["total"]
+
+    prix = float(e["prix_kwh_achat"])
+    abo = float(e["abonnement_an"])
 
     bois_kwh = 0.0
     for nom, info in res["infos_postes"].items():
@@ -390,52 +561,65 @@ def economics(cfg: dict, res: dict) -> dict:
     steres = bois_kwh / max(float(e.get("pci_bois_kwh_stere", 1500.0)), 1.0)
     cout_bois = steres * float(e.get("cout_bois_stere", 0.0))
 
-    achat = k["import_an"] * float(e["prix_kwh_achat"])
+    achat = k["import_an"] * prix
     revente = k["export_an"] * float(e.get("prix_kwh_revente", 0.0))
-    cout_avec = achat + float(e["abonnement_an"]) + cout_bois - revente
-    cout_sans = k["besoin_an"] * float(e["prix_kwh_achat"]) + float(e["abonnement_an"])
+    cout_avec = achat + abo + cout_bois - revente
+
+    # Contrefactuel du perimetre solaire : la MEME maison, les memes
+    # equipements, le meme bois, mais ni panneaux ni batterie. La veille des
+    # onduleurs n'existe alors pas : on part de la consommation des usages,
+    # pas du besoin total.
+    cout_sans = k["consommation_an"] * prix + abo + cout_bois
     facture_actuelle = float(e.get("facture_actuelle_an", 0.0))
 
-    econ_vs_sans = cout_sans - cout_avec
-    econ_vs_actuel = facture_actuelle - cout_avec
+    econ_solaire = cout_sans - cout_avec
+    econ_projet = facture_actuelle - cout_avec
 
-    # Retour actualise avec inflation energie, interpole a l'interieur de
-    # l'annee de bascule (pas seulement l'annee entiere qui suit)
     infl = float(e.get("inflation_energie", 0.0))
     horizon = int(e.get("duree_analyse_ans", 25))
-    cum, cum2 = -capex, -capex
-    retour_vs_sans = 0.0 if cum >= 0 else None
-    retour_vs_actuel = 0.0 if cum2 >= 0 else None
-    for an in range(1, horizon + 1):
-        gain1 = econ_vs_sans * (1 + infl) ** (an - 1)
-        gain2 = econ_vs_actuel * (1 + infl) ** (an - 1)
-        avant, avant2 = cum, cum2
-        cum += gain1
-        cum2 += gain2
-        if retour_vs_sans is None and cum >= 0:
-            retour_vs_sans = (an - 1) + (-avant / gain1 if gain1 > 1e-9 else 0.0)
-        if retour_vs_actuel is None and cum2 >= 0:
-            retour_vs_actuel = (an - 1) + (-avant2 / gain2 if gain2 > 1e-9 else 0.0)
+    retour_solaire, cum_solaire = _retour(capex_solaire, econ_solaire, infl, horizon)
+    retour_projet, cum_projet = _retour(capex_total, econ_projet, infl, horizon)
 
-    prod = max(k["production_an"], 1e-9)
-    utilise = k["besoin_an"] - k["import_an"]
-    lcoe = capex / max(utilise * horizon, 1e-9)
+    # kWh que l'installation a evite d'acheter : la consommation des usages
+    # moins ce qui a quand meme ete pris au reseau pour les couvrir.
+    utile = max(k["consommation_an"] - k["import_effectif_an"], 0.0)
+    lcoe = capex_solaire / (utile * horizon) if utile * horizon > 1.0 else None
+    batt = float(cfg["systeme"]["batt_kwh_nominal"])
 
     return {
-        "capex": capex,
-        "cout_par_wc": capex / max(k["kwc"] * 1000.0, 1e-9),
+        # --- perimetres ---
+        "capex_solaire": capex_solaire,
+        "capex_hors_solaire": recap["hors_solaire"],
+        "capex_total": capex_total,
+        "capex_par_categorie": dict(recap["par_categorie"]),
+        # "capex" reste l'investissement de reference des arbitrages, donc
+        # le perimetre solaire : c'est lui que lisent les balayages.
+        "capex": capex_solaire,
+        # --- ratios du perimetre solaire ---
+        "cout_par_wc": capex_solaire / max(k["kwc"] * 1000.0, 1e-9),
+        "cout_par_kwh_batterie": cout_categorie(recap, "stockage") / max(batt, 1e-9),
+        "cout_pv_par_wc": cout_categorie(recap, "pv", "conversion") /
+                          max(k["kwc"] * 1000.0, 1e-9),
+        # None quand l'installation ne couvre aucun besoin : afficher
+        # 2,5e13 EUR/kWh n'aide personne.
+        "lcoe_kwh_utile": lcoe,
+        # --- flux annuels ---
         "cout_annuel_avec_pv": cout_avec,
         "cout_annuel_sans_pv": cout_sans,
         "facture_actuelle": facture_actuelle,
-        "economie_vs_sans_pv": econ_vs_sans,
-        "economie_vs_actuel": econ_vs_actuel,
+        "economie_vs_sans_pv": econ_solaire,
+        "economie_vs_actuel": econ_projet,
         "cout_bois": cout_bois, "steres": steres,
-        "retour_ans_vs_sans_pv": retour_vs_sans,
-        "retour_ans_vs_actuel": retour_vs_actuel,
-        "gain_cumule_horizon": cum,
-        "lcoe_kwh_utile": lcoe,
+        "kwh_evites_an": utile,
+        # --- retours ---
+        "retour_ans_vs_sans_pv": retour_solaire,
+        "retour_ans_vs_actuel": retour_projet,
+        "gain_cumule_solaire": cum_solaire,
+        "gain_cumule_projet": cum_projet,
+        "gain_cumule_horizon": cum_projet,
+        # --- pertes ---
         "kwh_perdus_an": k["ecrete_an"],
-        "valeur_perdue_an": k["ecrete_an"] * float(e["prix_kwh_achat"]),
+        "valeur_perdue_an": k["ecrete_an"] * prix,
     }
 
 
@@ -470,15 +654,94 @@ def check_config(cfg: dict, res: dict) -> list:
                             f"souscrite de {s['p_souscrite_kva']:.0f} kVA est insuffisante "
                             f"aux moments de pointe."))
     cyc = k["cycles_batterie_an"]
-    if cyc > 320:
+    vie = duree_vie_batterie_ans(cyc)
+    if cyc > 320 and vie:
         a.append(("info", f"{cyc:.0f} cycles pleins par an : duree de vie estimee "
-                          f"{6000 / max(cyc, 1):.0f} ans."))
+                          f"{vie:.0f} ans."))
     for nom, info in res["infos_postes"].items():
         if info.get("heures_saturation_pac", 0) > 50:
             a.append(("attention",
                       f"{nom} : {info['heures_saturation_pac']:.0f} h/an ou la PAC sature, "
                       f"{info.get('th_appoint_kwh_an', 0):.0f} kWh repris par l'appoint "
                       f"electrique direct."))
+        if info.get("type_inconnu"):
+            a.append(("erreur",
+                      f"{nom} : type de poste \"{info['type_inconnu']}\" inconnu. "
+                      f"Il est affiche dans la liste mais ne consomme rien dans "
+                      f"la simulation. Choisissez un type valide ou supprimez-le."))
+        h_deb = info.get("heures_debordement_filtration", 0)
+        if h_deb > 200:
+            a.append(("info",
+                      f"{nom} : {h_deb:.0f} h/an ou la filtration deborde du profil "
+                      f"horaire choisi. La pompe ne peut pas debiter plus que sa "
+                      f"puissance nominale : elle tourne donc en dehors des heures "
+                      f"voulues, souvent hors soleil. Elargissez le profil ou "
+                      f"reduisez la duree de filtration."))
+    a.extend(check_nomenclature(cfg, res))
+    return a
+
+
+def check_nomenclature(cfg: dict, res: dict) -> list:
+    """Ce que la separation des couts peut silencieusement mal classer.
+
+    Une ligne mal rangee deplace de l'argent d'un perimetre a l'autre sans
+    rien signaler : c'est exactement ce que la separation cherche a eviter.
+    """
+    a = []
+    lignes, recap = compute_bom(cfg)
+    e = res["eco"]
+
+    devinees = [l["poste"] for l in lignes if l["categorie"] == "divers"]
+    if devinees:
+        a.append(("attention",
+                  f"{len(devinees)} ligne(s) de devis n'ont pas pu etre classees "
+                  f"automatiquement et sont rangees dans \"Divers installation "
+                  f"solaire\", donc COMPTEES dans le perimetre solaire : "
+                  + ", ".join(f"\"{n}\"" for n in devinees[:4])
+                  + ("..." if len(devinees) > 4 else "")
+                  + ". Verifiez leur categorie dans l'onglet 5 : si elles "
+                    "n'appartiennent pas a l'installation solaire, elles "
+                    "degradent le EUR/Wc et le temps de retour affiches."))
+
+    inconnues = [l["poste"] for l in lignes if l.get("auto_inconnue")]
+    if inconnues:
+        a.append(("attention",
+                  f"Regle de quantite inconnue sur : "
+                  + ", ".join(f"\"{n}\"" for n in inconnues[:4])
+                  + ". Ces lignes sont retombees sur la quantite saisie a la "
+                    "main. Revoyez la colonne \"Quantite auto\"."))
+
+    if recap["solaire"] <= 0:
+        a.append(("erreur",
+                  "Aucune ligne du devis n'est rangee dans le perimetre solaire : "
+                  "le cout au watt-crete, le cout du kWh et le temps de retour de "
+                  "l'installation sont sans objet. Classez au moins les modules, "
+                  "l'onduleur et la batterie."))
+    else:
+        eur_wc = e["cout_par_wc"]
+        if eur_wc > 0 and eur_wc < 0.35:
+            a.append(("attention",
+                      f"{eur_wc:.2f} EUR/Wc : c'est tres bas meme en achat direct "
+                      f"(compter 0,55 a 0,95 EUR/Wc avec stockage). Une ligne "
+                      f"oubliee, une quantite a zero ou une categorie basculee "
+                      f"hors perimetre solaire ?"))
+        elif eur_wc > 2.5:
+            a.append(("info",
+                      f"{eur_wc:.2f} EUR/Wc sur le perimetre solaire : c'est le "
+                      f"prix d'une installation posee par un professionnel "
+                      f"(1,80 a 2,50 EUR/Wc). Verifiez qu'aucun poste hors "
+                      f"solaire n'a ete range dans le perimetre."))
+
+    batt = float(cfg["systeme"]["batt_kwh_nominal"])
+    if batt > 0 and cout_categorie(recap, "stockage") <= 0:
+        a.append(("attention",
+                  f"{batt:.0f} kWh de batterie declares mais aucune ligne de devis "
+                  f"dans la categorie \"Batterie et BMS\" : le cout du stockage "
+                  f"est absent de tous les arbitrages."))
+    if total_kwc(cfg) > 0 and cout_categorie(recap, "pv") <= 0:
+        a.append(("attention",
+                  "Des panneaux sont declares mais aucune ligne de devis dans la "
+                  "categorie \"Modules et structure\"."))
     return a
 
 
@@ -894,7 +1157,7 @@ def _variantes_leviers(cfg, reduction, talon_w, cout_remplacement):
                       f"cablage compris. Le cout vient de la nomenclature.",
                       ajoute, None))
 
-    pack = 16.07
+    pack = KWH_PAR_PACK_16S
     for n in (1, 2):
         def batterie(c, n=n, pack=pack):
             c["systeme"]["batt_kwh_nominal"] = float(
@@ -969,7 +1232,8 @@ def leviers(cfg: dict, meteo: dict, reduction=0.10, talon_w=50.0,
     prix = float(cfg["economie"]["prix_kwh_achat"])
     ref = {
         "cout_an": base["eco"]["cout_annuel_avec_pv"],
-        "capex": base["eco"]["capex"],
+        "capex": base["eco"]["capex_solaire"],
+        "capex_total": base["eco"]["capex_total"],
         "import_an": base["kpi"]["import_an"],
         "besoin_an": base["kpi"]["besoin_an"],
         "autonomie": base["kpi"]["autonomie"],
@@ -981,13 +1245,23 @@ def leviers(cfg: dict, meteo: dict, reduction=0.10, talon_w=50.0,
         c = deepcopy(cfg)
         mutation(c)
         r = simulate(c, meteo)
-        cout = (r["eco"]["capex"] - ref["capex"]) if cout_impose is None \
-            else float(cout_impose)
+        # Un levier qui touche au materiel solaire (panneau, pack, onduleur)
+        # se chiffre par la difference de nomenclature, perimetre solaire.
+        # Un levier de sobriete ou de pilotage porte un cout impose, hors
+        # perimetre solaire : c'est un appareil remplace, pas un panneau.
+        d_solaire = r["eco"]["capex_solaire"] - ref["capex"]
+        if cout_impose is None:
+            cout, cout_sol, cout_hors = d_solaire, d_solaire, 0.0
+        else:
+            cout = float(cout_impose)
+            cout_sol, cout_hors = 0.0, cout
         gain = ref["cout_an"] - r["eco"]["cout_annuel_avec_pv"]
         retour = cout / gain if (cout > 0 and gain > 0) else None
         actions.append({
             "nom": nom, "categorie": cat, "detail": detail,
             "gain_an": gain,
+            "cout_solaire": cout_sol,
+            "cout_hors_solaire": cout_hors,
             "import_evite": ref["import_an"] - r["kpi"]["import_an"],
             "besoin_evite": ref["besoin_an"] - r["kpi"]["besoin_an"],
             "autonomie": r["kpi"]["autonomie"],
@@ -1011,17 +1285,26 @@ def budget_consommation(cfg: dict, meteo: dict, res: dict, cible=0.92):
     m = res["mensuel"]
     out = []
     for k in range(12):
-        lo, hi = 0.05, 4.0
+        lo, hi = 0.02, 4.0
         base = m["consommation"][k]
         njours = max(m["jours"][k], 1e-9)
         if base <= 0:
             out.append((0.0, 0.0))
             continue
-        # dichotomie sur un facteur d'echelle de la consommation du mois
+        # La dichotomie ne vaut que si la borne basse tient la cible et que
+        # la borne haute ne la tient pas. Sinon on renvoyait le plancher
+        # comme un resultat : un mois de janvier a 4,11 kWh/jour alors que
+        # l'autonomie reelle y etait de 2,7 %, soit un chiffre faux sans le
+        # moindre signe. On rend None, l'interface affiche un tiret.
+        if _autonomie_mois_scaled(cfg, meteo, res, k, lo) < cible:
+            out.append((None, None))          # meme quasiment a l'arret, la
+            continue                          # cible reste hors d'atteinte
+        if _autonomie_mois_scaled(cfg, meteo, res, k, hi) >= cible:
+            out.append((base * hi, base * hi / njours))   # jamais limitant
+            continue
         for _ in range(18):
             f = (lo + hi) / 2.0
-            aut = _autonomie_mois_scaled(cfg, meteo, res, k, f)
-            if aut >= cible:
+            if _autonomie_mois_scaled(cfg, meteo, res, k, f) >= cible:
                 lo = f
             else:
                 hi = f
@@ -1037,6 +1320,204 @@ def _autonomie_mois_scaled(cfg, meteo, res, mois_idx, facteur):
     besoin = d["besoin_total"][mask].sum()
     imp = d["import"][mask].sum()
     return 1.0 - imp / max(besoin, 1e-9)
+
+
+# --------------------------------------------------------------------------
+# Optimum a deux dimensions : puissance PV x capacite batterie
+#
+#   Les deux ne sont pas independantes : des panneaux sans batterie produisent
+#   un surplus qu'on jette, une batterie sans panneaux n'a rien a stocker.
+#   Balayer l'une puis l'autre donne donc une reponse fausse ; il faut la
+#   grille complete. Une simulation coute moins de 0,1 s, une grille de 60
+#   points quelques secondes : c'est abordable.
+# --------------------------------------------------------------------------
+#   cle -> (libelle, sens, unite, decimales, aide courte)
+#   sens = +1 : on maximise ; -1 : on minimise
+CRITERES_GRILLE = {
+    "gain": ("Gain cumule sur l'horizon", +1, "EUR", 0,
+             "Ce que l'installation aura rapporte, net de son cout, au bout "
+             "de la duree d'analyse. C'est le critere qui designe la taille "
+             "la plus profitable, celle ou l'on gagne le plus d'argent."),
+    "retour": ("Temps de retour le plus court", -1, "ans", 1,
+               "La taille qui se rembourse le plus vite. Attention : c'est "
+               "presque toujours la plus petite installation testee, parce "
+               "que les premiers kWh sont les plus rentables. A lire avec le "
+               "chemin de croissance."),
+    "autonomie_sous_seuil": ("Autonomie maximale, tranches rentables", +1, "%", 2,
+                             "La plus grande autonomie atteignable sans "
+                             "jamais acheter une tranche qui mettrait plus "
+                             "que le seuil a se rembourser."),
+    "cout_kwh": ("Cout du kWh evite le plus bas", -1, "EUR/kWh", 3,
+                 "La taille qui produit le kWh autoconsomme le moins cher."),
+    "autonomie": ("Autonomie maximale", +1, "%", 2,
+                  "La plus grande autonomie, sans aucune consideration de "
+                  "cout. Designe toujours le plus gros point de la grille."),
+}
+
+
+def _config_dimensionnee(cfg: dict, kwc_cible: float, batt_kwh: float):
+    """Copie de la configuration mise a l'echelle. Retourne (cfg, kwc_reel).
+
+    Les panneaux sont un nombre entier par groupe : la puissance obtenue
+    n'est pas exactement celle demandee, et c'est elle qu'il faut rapporter.
+    """
+    from copy import deepcopy
+    c = deepcopy(cfg)
+    base = total_kwc(cfg)
+    if base > 0 and kwc_cible is not None:
+        r = float(kwc_cible) / base
+        for ch in c["champs"]:
+            ch["n_panneaux"] = max(int(round(ch["n_panneaux"] * r)), 0)
+            n_ser = max(int(ch.get("n_serie", 1) or 1), 1)
+            if ch["n_panneaux"]:
+                ch["n_serie"] = min(n_ser, ch["n_panneaux"])
+    c["systeme"]["batt_kwh_nominal"] = float(batt_kwh)
+    return c, total_kwc(c)
+
+
+def grille_dimensionnement(cfg: dict, meteo: dict, kwc_valeurs, batt_valeurs,
+                           progress=None) -> dict:
+    """Simule toutes les combinaisons puissance PV x capacite batterie.
+
+    Retourne un dictionnaire de matrices indexees [i_batterie][j_puissance],
+    plus la liste des puissances reellement obtenues.
+    """
+    kwc_valeurs = [float(v) for v in kwc_valeurs]
+    batt_valeurs = [float(v) for v in batt_valeurs]
+    e = cfg["economie"]
+    infl = float(e.get("inflation_energie", 0.0))
+    horizon = int(e.get("duree_analyse_ans", 25))
+
+    n_b, n_k = len(batt_valeurs), len(kwc_valeurs)
+    vide = lambda: np.full((n_b, n_k), np.nan)
+    m = {c: vide() for c in ("autonomie", "capex", "economie", "retour",
+                             "gain", "cout_kwh", "import", "ecrete",
+                             "production", "cout_par_wc")}
+    kwc_reels = list(kwc_valeurs)
+    total = max(n_b * n_k, 1)
+    fait = 0
+
+    for i, batt in enumerate(batt_valeurs):
+        for j, kwc in enumerate(kwc_valeurs):
+            c, kwc_reel = _config_dimensionnee(cfg, kwc, batt)
+            if i == 0:
+                kwc_reels[j] = kwc_reel
+            r = simulate(c, meteo)
+            k, eco = r["kpi"], r["eco"]
+            m["autonomie"][i, j] = k["autonomie"]
+            m["capex"][i, j] = eco["capex_solaire"]
+            m["economie"][i, j] = eco["economie_vs_sans_pv"]
+            m["import"][i, j] = k["import_an"]
+            m["ecrete"][i, j] = k["ecrete_an"]
+            m["production"][i, j] = k["production_an"]
+            m["cout_par_wc"][i, j] = eco["cout_par_wc"]
+            ret, cum = _retour(eco["capex_solaire"], eco["economie_vs_sans_pv"],
+                               infl, horizon)
+            m["retour"][i, j] = np.nan if ret is None else ret
+            m["gain"][i, j] = cum
+            lc = eco["lcoe_kwh_utile"]
+            m["cout_kwh"][i, j] = np.nan if lc is None else lc
+            fait += 1
+            if progress:
+                progress(int(100 * fait / total),
+                         f"{kwc_reel:.1f} kWc / {batt:.0f} kWh")
+
+    return {"kwc": kwc_reels, "kwc_demandes": kwc_valeurs, "batt": batt_valeurs,
+            "horizon": horizon, "matrices": m}
+
+
+def chemin_croissance(grille: dict, seuil_ans: float = 10.0,
+                      depart=(0, 0)) -> dict:
+    """Par quoi commencer, et quand s'arreter, en agrandissant pas a pas.
+
+    A chaque etape on compare les deux seules decisions possibles : un cran
+    de panneaux de plus, ou un cran de batterie de plus. On retient celle qui
+    se rembourse le plus vite, ET seulement si elle se rembourse sous le
+    seuil. C'est la facon dont une installation grandit reellement, et cela
+    repond a la question que le temps de retour global ne sait pas traiter :
+    est-ce que la PROCHAINE tranche vaut le coup ?
+    """
+    m = grille["matrices"]
+    kwc, batt = grille["kwc"], grille["batt"]
+    horizon = grille["horizon"]
+    n_b, n_k = len(batt), len(kwc)
+    i, j = depart
+    etapes = [{
+        "i": i, "j": j, "quoi": "Point de depart",
+        "kwc": kwc[j], "batt": batt[i],
+        "capex": float(m["capex"][i, j]),
+        "autonomie": float(m["autonomie"][i, j]),
+        "cout_tranche": None, "gain_tranche": None, "retour_tranche": None,
+    }]
+    arret = None
+    vus = {(i, j)}
+
+    while True:
+        candidats = []
+        for di, dj, quoi in ((0, 1, "panneaux"), (1, 0, "batterie")):
+            ni, nj = i + di, j + dj
+            if ni >= n_b or nj >= n_k or (ni, nj) in vus:
+                continue
+            cout = float(m["capex"][ni, nj] - m["capex"][i, j])
+            gain = float(m["economie"][ni, nj] - m["economie"][i, j])
+            if not np.isfinite(cout) or not np.isfinite(gain):
+                continue
+            if cout <= 1e-6:
+                ret = 0.0 if gain > 0 else None
+            elif gain <= 1e-9:
+                ret = None
+            else:
+                ret = cout / gain      # sans inflation : comparaison entre eux
+            candidats.append({"i": ni, "j": nj, "quoi": quoi, "cout": cout,
+                              "gain": gain, "retour": ret})
+        faisables = [c for c in candidats if c["retour"] is not None]
+        if not faisables:
+            arret = ("Plus aucune tranche ne rapporte quoi que ce soit."
+                     if candidats else "Bord de la grille atteint : elargissez "
+                                       "les plages testees.")
+            break
+        meilleur = min(faisables, key=lambda c: c["retour"])
+        if meilleur["retour"] > seuil_ans:
+            arret = (f"La meilleure tranche suivante ({meilleur['quoi']}) "
+                     f"mettrait {meilleur['retour']:.1f} ans a se rembourser, "
+                     f"au-dela du seuil de {seuil_ans:.0f} ans.")
+            break
+        i, j = meilleur["i"], meilleur["j"]
+        vus.add((i, j))
+        libelle = (f"+{kwc[j] - etapes[-1]['kwc']:.1f} kWc de panneaux"
+                   if meilleur["quoi"] == "panneaux"
+                   else f"+{batt[i] - etapes[-1]['batt']:.0f} kWh de batterie")
+        etapes.append({
+            "i": i, "j": j, "quoi": libelle,
+            "kwc": kwc[j], "batt": batt[i],
+            "capex": float(m["capex"][i, j]),
+            "autonomie": float(m["autonomie"][i, j]),
+            "cout_tranche": meilleur["cout"], "gain_tranche": meilleur["gain"],
+            "retour_tranche": meilleur["retour"],
+        })
+        if len(etapes) > n_b * n_k:
+            break
+    return {"etapes": etapes, "arret": arret, "seuil_ans": seuil_ans,
+            "horizon": horizon}
+
+
+def optimum_grille(grille: dict, critere: str = "gain",
+                   seuil_ans: float = 10.0):
+    """Indice (i_batterie, j_puissance) du meilleur point selon un critere."""
+    m = grille["matrices"]
+    if critere == "autonomie_sous_seuil":
+        chemin = chemin_croissance(grille, seuil_ans)
+        d = chemin["etapes"][-1]
+        return d["i"], d["j"]
+    cle = {"gain": "gain", "retour": "retour", "cout_kwh": "cout_kwh",
+           "autonomie": "autonomie"}.get(critere, "gain")
+    mat = m[cle]
+    if np.all(np.isnan(mat)):
+        return 0, 0
+    sens = CRITERES_GRILLE.get(critere, CRITERES_GRILLE["gain"])[1]
+    plat = np.where(np.isnan(mat), -np.inf if sens > 0 else np.inf, mat)
+    idx = int(np.argmax(plat) if sens > 0 else np.argmin(plat))
+    return divmod(idx, mat.shape[1])
 
 
 def parse_sweep_values(raw) -> list[float]:
@@ -1075,18 +1556,119 @@ def parse_sweep_values(raw) -> list[float]:
     return vals
 
 
-def compute_marginal_rentability(out: list[dict], key="economie_vs_actuel") -> list[float]:
-    """Retourne le taux de rentabilite marginale par unite supplementaire."""
-    scores = [0.0]
+#: etats possibles d'une tranche, et ce qu'ils veulent dire pour la decision
+TRANCHE_STATUTS = {
+    "depart": "Point de depart du balayage, pas de tranche avant lui.",
+    "gratuit": "Cette tranche ne coute rien de plus et rapporte : a prendre.",
+    "amorti": "Cette tranche se rembourse toute seule dans l'horizon d'analyse.",
+    "trop_long": "Cette tranche finit par se rembourser, mais au-dela de "
+                 "l'horizon d'analyse.",
+    "jamais": "Cette tranche coute et ne rapporte rien, ou fait perdre : "
+              "elle ne se remboursera pas.",
+    "sans_surcout": "Cette tranche ne change pas la nomenclature (inclinaison, "
+                    "azimut) : il n'y a rien a amortir.",
+}
+
+
+def tranches_successives(out: list[dict], cfg: dict,
+                         key: str = "economie_vs_sans_pv") -> list[dict]:
+    """Ce que coute et rapporte le PASSAGE d'un point du balayage au suivant.
+
+    Pour chaque point i, on compare au point i-1 :
+
+      * cout_tranche  = surcout de materiel du passage (perimetre solaire) ;
+      * gain_tranche  = euros economises en plus chaque annee ;
+      * retour_tranche = annees pour que cette tranche SEULE se rembourse,
+        inflation de l'energie comprise, independamment de tout ce qui a
+        ete installe avant ;
+      * gain_net_tranche = ce que la tranche aura rapporte, net de son cout,
+        au bout de l'horizon d'analyse.
+
+    C'est la difference avec le temps de retour global : une premiere
+    batterie amortie en 3 ans suivie d'une seconde qui ne s'amortit jamais
+    donnent un retour global d'environ 6 ans, chiffre qui masque exactement
+    la decision a prendre. Ici la seconde tranche ressort telle qu'elle est.
+    """
+    e = cfg["economie"]
+    infl = float(e.get("inflation_energie", 0.0))
+    horizon = int(e.get("duree_analyse_ans", 25))
+    if out and key not in out[0]:
+        key = "economie_vs_actuel"
+
+    tranches = []
+    for i, cur in enumerate(out):
+        if i == 0:
+            tranches.append({"cout_tranche": None, "gain_tranche": None,
+                             "retour_tranche": None, "gain_net_tranche": None,
+                             "delta_valeur": None, "statut": "depart"})
+            continue
+        prev = out[i - 1]
+        cout = float(cur.get("capex", 0.0)) - float(prev.get("capex", 0.0))
+        gain = float(cur.get(key, 0.0)) - float(prev.get(key, 0.0))
+        delta_v = float(cur.get("valeur", 0.0)) - float(prev.get("valeur", 0.0))
+
+        if cout <= 1e-6:
+            # Rien a payer. Si cela rapporte quand meme (une inclinaison mieux
+            # choisie), la tranche est gratuite et immediatement rentable ;
+            # sinon il n'y a simplement rien a amortir.
+            if gain > 1e-9:
+                statut, (retour, net) = "gratuit", _retour(0.0, gain, infl, horizon)
+            else:
+                statut, retour, net = "sans_surcout", None, None
+        elif gain <= 1e-9:
+            statut, retour = "jamais", None
+            net = -cout
+        else:
+            retour, net = _retour(cout, gain, infl, horizon)
+            statut = "amorti" if retour is not None else "trop_long"
+        tranches.append({"cout_tranche": cout, "gain_tranche": gain,
+                         "retour_tranche": retour, "gain_net_tranche": net,
+                         "delta_valeur": delta_v, "statut": statut})
+    return tranches
+
+
+def derniere_tranche_rentable(out: list[dict], seuil_ans: float = None):
+    """Indice du dernier point dont la tranche se rembourse assez vite.
+
+    C'est la reponse a "jusqu'ou est-ce que je pousse ?" : au-dela, chaque
+    tranche supplementaire coute plus qu'elle ne rapportera. Retourne None
+    si aucune tranche ne tient le critere.
+    """
+    dernier = None
+    for i, o in enumerate(out):
+        if o.get("statut") == "depart":
+            dernier = i
+            continue
+        r = o.get("retour_tranche")
+        if r is None:
+            break
+        if seuil_ans is not None and r > seuil_ans:
+            break
+        dernier = i
+    return dernier
+
+
+def compute_marginal_rentability(out: list[dict], key="economie_vs_sans_pv") -> list[float]:
+    """Euros economises chaque annee par euro supplementaire investi.
+
+    Le capex compare est celui du PERIMETRE SOLAIRE : pendant un balayage,
+    le reste du projet ne bouge pas, mais il ecraserait le ratio.
+    """
+    if out and key not in out[0]:
+        key = "economie_vs_actuel"        # series produites avant la separation
+    scores = [None]
     for i in range(1, len(out)):
         prev = out[i - 1]
         cur = out[i]
-        delta_capex = max(float(cur.get("capex", 0.0)) - float(prev.get("capex", 0.0)), 0.0)
+        delta_capex = float(cur.get("capex", 0.0)) - float(prev.get("capex", 0.0))
         delta_gain = float(cur.get(key, 0.0)) - float(prev.get(key, 0.0))
-        if delta_capex <= 0:
-            scores.append(0.0)
+        if delta_capex <= 1e-6:
+            # Rien de plus n'a ete depense : c'est le cas de tout balayage
+            # d'inclinaison ou d'azimut. Un ratio n'a pas de sens ici, et
+            # afficher 0,000 laissait croire a une option sans interet.
+            scores.append(None)
         else:
-            scores.append(max(delta_gain / delta_capex, 0.0))
+            scores.append(delta_gain / delta_capex)
     return scores
 
 
@@ -1110,6 +1692,10 @@ def sweep(cfg: dict, meteo: dict, variable: str, valeurs, progress=None):
             r = float(v) / base
             for ch in c["champs"]:
                 ch["n_panneaux"] = max(int(round(ch["n_panneaux"] * r)), 0)
+            # On ne peut installer qu'un nombre ENTIER de panneaux par groupe :
+            # la puissance reellement simulee n'est pas celle qui a ete
+            # demandee. Afficher la valeur demandee ferait mentir l'axe.
+            v = total_kwc(c)
         elif variable == "batterie":
             c["systeme"]["batt_kwh_nominal"] = float(v)
         elif variable == "onduleurs":
@@ -1121,18 +1707,28 @@ def sweep(cfg: dict, meteo: dict, variable: str, valeurs, progress=None):
                     "production": r["kpi"]["production_an"],
                     "import": r["kpi"]["import_an"],
                     "ecrete": r["kpi"]["ecrete_an"],
-                    "capex": r["eco"]["capex"],
-                    "retour": r["eco"]["retour_ans_vs_actuel"],
+                    "kwc": r["kpi"]["kwc"],
+                    # "capex" = perimetre solaire : c'est la seule depense que
+                    # le balayage fait varier, et la seule qui doit etre
+                    # comparee au gain qu'il apporte.
+                    "capex": r["eco"]["capex_solaire"],
+                    "capex_hors_solaire": r["eco"]["capex_hors_solaire"],
+                    "capex_total": r["eco"]["capex_total"],
+                    "cout_par_wc": r["eco"]["cout_par_wc"],
+                    "lcoe": r["eco"]["lcoe_kwh_utile"],
+                    "retour": r["eco"]["retour_ans_vs_sans_pv"],
+                    "retour_projet": r["eco"]["retour_ans_vs_actuel"],
+                    "gain_cumule_solaire": r["eco"]["gain_cumule_solaire"],
+                    "economie_vs_sans_pv": r["eco"]["economie_vs_sans_pv"],
                     "economie_vs_actuel": r["eco"]["economie_vs_actuel"],
                     "production_mensuel": r["mensuel"]["production_dc"].tolist(),
                     "autonomie_mensuel": r["mensuel"]["autonomie"].tolist(),
                     "import_mensuel": r["mensuel"]["import"].tolist()})
         if progress:
             progress(int(100 * (i + 1) / len(valeurs)), f"{variable} = {v}")
-    for i, item in enumerate(out):
-        item["rentabilite_marginale"] = 0.0 if i == 0 else 0.0
     if out:
-        scores = compute_marginal_rentability(out)
-        for i, score in enumerate(scores):
+        for i, score in enumerate(compute_marginal_rentability(out)):
             out[i]["rentabilite_marginale"] = score
+        for i, t in enumerate(tranches_successives(out, cfg)):
+            out[i].update(t)
     return out

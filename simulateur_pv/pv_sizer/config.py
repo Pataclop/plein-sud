@@ -10,7 +10,7 @@ Format d'une ligne de schema :
 L'aide est affichee en infobulle au survol du libelle ET du champ.
 """
 from __future__ import annotations
-import json, os, copy, datetime
+import json, os, copy, datetime, unicodedata
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(APP_DIR, "data")
@@ -644,8 +644,15 @@ ECO_SCHEMA = [
     ("facture_actuelle_an", "Facture actuelle (EUR/an)",
      "float", 0, 30000, 50,
      "<b>Ce que vous depensez aujourd'hui en energie, avant travaux.</b><br>"
-     "Additionnez electricite, gaz, fioul, bois achete. C'est la reference du "
-     "calcul de retour sur investissement affiche en haut des resultats."),
+     "Additionnez electricite, gaz, fioul, bois achete.<br><br>"
+     "<b>Ce chiffre ne sert qu'au bilan du PROJET COMPLET</b>, celui qui "
+     "compare l'investissement total (solaire + chauffe-eau + insert + "
+     "isolation) a votre facture d'avant travaux.<br>"
+     "Le temps de retour de la seule installation solaire, lui, ne s'appuie "
+     "pas dessus : il compare le sous-total solaire de la nomenclature a "
+     "l'energie que les panneaux et la batterie evitent d'acheter, a maison "
+     "inchangee. C'est ce second chiffre qui doit guider un choix de "
+     "panneaux, d'onduleur ou de batterie."),
     ("cout_bois_stere", "Prix du stere de bois (EUR/stere)", "float", 0, 200, 5,
      "<b>Prix d'achat d'un stere de bois de chauffage.</b><br>"
      "Mettez 0 si vous le produisez vous-meme. Repere : 70 a 110 EUR/stere "
@@ -667,7 +674,9 @@ ECO_SCHEMA = [
      "<b>Duree sur laquelle le gain cumule est calcule, en annees.</b><br>"
      "25 ans correspond a la garantie de production usuelle des panneaux. "
      "Les onduleurs et la batterie seront probablement remplaces une fois "
-     "d'ici la : pensez a le prevoir dans la nomenclature."),
+     "d'ici la : ajoutez la ligne correspondante dans la nomenclature, "
+     "categorie <i>Onduleurs et conversion</i> ou <i>Batterie et BMS</i>, "
+     "pour qu'elle pese sur le bon perimetre."),
 ]
 
 ECO_DEFAULTS = {"prix_kwh_achat": 0.2016, "abonnement_an": 280.0, "prix_kwh_revente": 0.0,
@@ -852,36 +861,295 @@ def eclater_grappes(champ: dict) -> list:
 
 
 # --------------------------------------------------------------------------
-# Nomenclature : quantites automatiques
+# Nomenclature : categories, perimetre solaire, quantites automatiques
+#
+#   Chaque ligne de devis porte une CATEGORIE. Les categories marquees
+#   "solaire" forment le PERIMETRE DE L'INSTALLATION SOLAIRE : panneaux,
+#   structure, onduleurs, batterie, cablage, protections, pose, demarches,
+#   outillage. C'est ce sous-total, et lui seul, qui sert a juger un
+#   dimensionnement : EUR/Wc, cout du kWh stocke, cout du kWh autoproduit,
+#   temps de retour de l'installation, et tous les couts affiches dans les
+#   onglets Optimisation, Orientations et Leviers.
+#
+#   Les autres categories (chauffe-eau thermodynamique, insert, isolation...)
+#   restent dans le devis et dans le bilan du PROJET COMPLET, mais n'entrent
+#   jamais dans les arbitrages panneaux / onduleur / batterie : ajouter un
+#   pack de batterie ne doit pas voir son temps de retour pollue par le prix
+#   d'une isolation de combles.
 # --------------------------------------------------------------------------
+BOM_CATEGORIES = {
+    "pv": {
+        "label": "1. Modules et structure",
+        "solaire": True,
+        "aide": "Panneaux, rails, pinces, visserie, lestage, ancrages : ce qui "
+                "produit et ce qui le tient.",
+    },
+    "conversion": {
+        "label": "2. Onduleurs et conversion",
+        "solaire": True,
+        "aide": "Onduleurs hybrides, regulateurs, optimiseurs, dongles de "
+                "supervision livres avec l'onduleur.",
+    },
+    "stockage": {
+        "label": "3. Batterie et BMS",
+        "solaire": True,
+        "aide": "Cellules LFP, BMS, busbars, kit de compression, coffrets, "
+                "fusibles classe T, cablage de puissance de la batterie.",
+    },
+    "electrique": {
+        "label": "4. Cablage et protections",
+        "solaire": True,
+        "aide": "Cable solaire, connecteurs, coffrets DC et AC, parafoudres, "
+                "sectionneurs, disjoncteurs, differentiels, mise a la terre, "
+                "comptage et supervision.",
+    },
+    "genie_civil": {
+        "label": "5. Genie civil et pose",
+        "solaire": True,
+        "aide": "Terrassement, tranchee, massifs beton, plots, cloture, "
+                "location de materiel de levage, main-d'oeuvre eventuelle.",
+    },
+    "admin": {
+        "label": "6. Administratif et raccordement",
+        "solaire": True,
+        "aide": "Consuel, declaration prealable en mairie, convention "
+                "d'autoconsommation Enedis, extension d'assurance.",
+    },
+    "outillage": {
+        "label": "7. Outillage et securite",
+        "solaire": True,
+        "aide": "Achete une fois pour poser soi-meme : sertisseuse, pince MC4, "
+                "pince ampermetrique continue, multimetre, EPI, echafaudage. "
+                "Compte dans l'investissement, mais reste reutilisable.",
+    },
+    "divers": {
+        "label": "8. Divers installation solaire",
+        "solaire": True,
+        "aide": "Ce qui appartient a l'installation solaire sans entrer dans "
+                "les categories precedentes. C'est aussi la categorie par "
+                "defaut d'une ligne dont le libelle n'est pas reconnu.",
+    },
+    "thermique": {
+        "label": "9. Equipements thermiques (HORS solaire)",
+        "solaire": False,
+        "aide": "Chauffe-eau thermodynamique, pompe a chaleur, insert, poele, "
+                "conduit. Ces equipements changent la CONSOMMATION simulee, "
+                "donc le resultat, mais leur prix ne doit pas etre impute a "
+                "l'installation solaire.",
+    },
+    "batiment": {
+        "label": "10. Batiment et isolation (HORS solaire)",
+        "solaire": False,
+        "aide": "Isolation, etancheite a l'air, menuiseries, VMC, couverture. "
+                "Meme logique que ci-dessus.",
+    },
+    "autre": {
+        "label": "11. Autre (HORS solaire)",
+        "solaire": False,
+        "aide": "Le reste du projet : comptabilise dans le total general, "
+                "exclu du perimetre solaire.",
+    },
+}
+
+#: ordre d'affichage et de regroupement des categories
+ORDRE_CATEGORIES = list(BOM_CATEGORIES)
+
+#: categories qui composent le perimetre de l'installation solaire
+CATEGORIES_SOLAIRE = [k for k, v in BOM_CATEGORIES.items() if v["solaire"]]
+
+
+def est_solaire(categorie: str) -> bool:
+    """Cette categorie de devis entre-t-elle dans le perimetre solaire ?"""
+    d = BOM_CATEGORIES.get(categorie) or BOM_CATEGORIES["divers"]
+    return bool(d["solaire"])
+
+
+def libelle_categorie(categorie: str) -> str:
+    d = BOM_CATEGORIES.get(categorie) or BOM_CATEGORIES["divers"]
+    return d["label"]
+
+
+def aide_categories() -> str:
+    """Infobulle expliquant le decoupage et ce qu'il change."""
+    lignes = [
+        "<b>A quel poste du projet cette ligne appartient-elle ?</b><br>",
+        "Les categories 1 a 8 forment le <b>perimetre de l'installation "
+        "solaire</b>. Leur sous-total est celui qui pilote tous les "
+        "arbitrages : EUR/Wc, cout du kWh stocke, temps de retour de "
+        "l'installation, et les couts affiches dans les onglets Optimisation, "
+        "Orientations et Leviers.<br>",
+        "Les categories 9 a 11 restent dans le devis et dans le bilan du "
+        "<b>projet complet</b>, mais sont exclues de ces arbitrages : le prix "
+        "d'un insert ne doit pas peser sur le temps de retour d'un pack de "
+        "batterie.<br>",
+    ]
+    for k in ORDRE_CATEGORIES:
+        d = BOM_CATEGORIES[k]
+        marque = "&#9679;" if d["solaire"] else "&#9675;"
+        lignes.append(f"{marque} <b>{d['label']}</b> : {d['aide']}")
+    lignes.append("<br><i>&#9679; perimetre solaire &nbsp;&nbsp;&nbsp; "
+                  "&#9675; hors perimetre solaire</i>")
+    return "<br>".join(lignes)
+
+
+# Regles de classement automatique, testees DANS L'ORDRE : la premiere
+# categorie dont un mot-cle apparait dans le libelle gagne. Sert a reprendre
+# les nomenclatures enregistrees avant l'existence des categories, et a
+# proposer une categorie quand l'utilisateur saisit un nouveau libelle.
+_REGLES_CATEGORIE = [
+    ("thermique", ("chauffe-eau", "chauffe eau", "ballon", "thermodynamique",
+                   "insert", "poele", "cheminee", "conduit", "pompe a chaleur",
+                   "climatis", "plancher chauffant", "radiateur", "chaudiere",
+                   "seche-serviette", "solaire thermique", "capteur thermique")),
+    ("batiment", ("isolation", "isolant", "comble", "etancheite", "menuiserie",
+                  "fenetre", "vmc", "toiture", "couverture", "charpente",
+                  "enduit", "bardage", "placo", "ravalement")),
+    ("outillage", ("outillage", "outil ", "outils", "epi ", " epi", "sertisseuse",
+                   "sertissage", "multimetre", "amperemetrique", "ampermetrique",
+                   "echafaudage", "harnais", "denudeur", "dynamometrique",
+                   "pince mc4", "chargeur d'equilibrage", "location")),
+    ("stockage", ("cellule", "lfp", "lifepo", "bms", "busbar", "compression",
+                  "classe t", "batterie", "accumulateur", "equilibrage",
+                  "balancer", "shunt")),
+    ("conversion", ("onduleur", "inverter", "hybride", "mppt", "regulateur",
+                    "micro-onduleur", "optimiseur")),
+    ("pv", ("module photovolt", "modules photovolt", "panneau", "panneaux",
+            "structure", "fixation", "rail", "pince milieu", "pince "
+            "extremite", "lestage", "visserie", "ancrage", "plot", "tracker",
+            "chassis", "equerre")),
+    ("genie_civil", ("terrassement", "tranchee", "beton", "dalle",
+                     "genie civil", "cloture", "grillage", "massif", "fouille",
+                     "mini-pelle", "nacelle", "main-d'oeuvre", "manutention")),
+    ("admin", ("consuel", "declaration", "enedis", "convention", "assurance",
+               "permis", "mairie", "raccordement", "attestation", "cacsi")),
+    ("electrique", ("cabl", "cable", "connecteur", "mc4", "coffret",
+                    "parafoudre", "protection", "tableau", "disjoncteur",
+                    "differentiel", "sectionneur", "fusible", "terre", "cosse",
+                    "gaine", "goulotte", "chemin de cable", "supervision",
+                    "mesure", "compteur", "routeur", "borne", "presse-etoupe",
+                    "boitier")),
+]
+
+
+def _sans_accents(txt: str) -> str:
+    """Minuscules sans accents : les libelles sont saisis au clavier et
+    enregistres tels quels (ensure_ascii=False), mais les mots-cles de
+    classement sont ecrits en ASCII."""
+    d = unicodedata.normalize("NFD", str(txt or "").lower())
+    return "".join(c for c in d if unicodedata.category(c) != "Mn")
+
+
+def deviner_categorie(poste: str, auto: str = "fixe") -> str:
+    """Categorie proposee pour une ligne de devis, d'apres son libelle.
+
+    Le libelle prime : c'est lui qui distingue "Cablage DC PV" (electrique)
+    de "Modules photovoltaiques" (pv), alors que les deux peuvent etre
+    indexes sur la meme quantite automatique. La regle de quantite ne sert
+    que de repli.
+    """
+    t = _sans_accents(poste)
+    for cat, mots in _REGLES_CATEGORIE:
+        if any(m in t for m in mots):
+            return cat
+    repli = {"panneaux": "pv", "m2_panneaux": "pv", "kwc": "pv",
+             "onduleurs": "conversion", "cellules": "stockage",
+             "packs": "stockage", "batt_kwh": "stockage",
+             "grappes": "electrique"}
+    return repli.get(auto, "divers")
+
+
 AUTO_QTY = {
     "fixe": "Quantite saisie manuellement",
     "panneaux": "Nombre total de panneaux",
     "kwc": "Puissance crete installee (kWc)",
     "onduleurs": "Nombre d'onduleurs",
     "batt_kwh": "Capacite batterie nominale (kWh)",
-    "cellules": "Nombre de cellules LFP (16S par 5,12 kWh)",
+    "cellules": "Nombre de cellules LFP (16 par pack 16S)",
     "packs": "Nombre de packs 16S",
     "m2_panneaux": "Surface de modules (m2)",
+    "grappes": "Nombre de grappes (strings)",
 }
 
 BOM_DEFAUT = [
-    {"poste": "Modules photovoltaiques", "auto": "panneaux", "qte": 0, "pu": 68.0, "unite": "u"},
-    {"poste": "Structure et fixations", "auto": "panneaux", "qte": 0, "pu": 72.0, "unite": "u"},
-    {"poste": "Onduleurs hybrides Deye", "auto": "onduleurs", "qte": 0, "pu": 1900.0, "unite": "u"},
-    {"poste": "Cellules LFP 314 Ah grade A", "auto": "cellules", "qte": 0, "pu": 62.0, "unite": "u"},
-    {"poste": "BMS 16S 200 A", "auto": "packs", "qte": 0, "pu": 240.0, "unite": "u"},
-    {"poste": "Coffrets, busbars, compression, fusibles classe T", "auto": "packs", "qte": 0, "pu": 320.0, "unite": "u"},
-    {"poste": "Cablage DC PV, connecteurs, chemins de cables", "auto": "kwc", "qte": 0, "pu": 28.0, "unite": "kWc"},
-    {"poste": "Cablage batterie 95 mm2 et cosses", "auto": "onduleurs", "qte": 0, "pu": 320.0, "unite": "u"},
-    {"poste": "Tableaux AC/DC, parafoudres, protections", "auto": "fixe", "qte": 1, "pu": 2600.0, "unite": "lot"},
-    {"poste": "Terrassement, tranchee, liaison, mise a la terre", "auto": "fixe", "qte": 1, "pu": 1800.0, "unite": "lot"},
-    {"poste": "Supervision et mesure par circuit", "auto": "fixe", "qte": 1, "pu": 600.0, "unite": "lot"},
-    {"poste": "Consuel, declaration prealable, convention Enedis", "auto": "fixe", "qte": 1, "pu": 400.0, "unite": "lot"},
-    {"poste": "Chauffe-eau thermodynamique 300 L", "auto": "fixe", "qte": 1, "pu": 1900.0, "unite": "u"},
-    {"poste": "Insert bois et conduit", "auto": "fixe", "qte": 1, "pu": 4000.0, "unite": "u"},
-    {"poste": "Isolation combles et etancheite a l'air", "auto": "fixe", "qte": 1, "pu": 3000.0, "unite": "lot"},
+    # --- 1. modules et structure ---
+    {"poste": "Modules photovoltaiques", "categorie": "pv",
+     "auto": "panneaux", "qte": 0, "pu": 68.0, "unite": "u"},
+    {"poste": "Structure et fixations (rails, pinces, visserie inox)",
+     "categorie": "pv", "auto": "panneaux", "qte": 0, "pu": 72.0, "unite": "u"},
+    # --- 2. conversion ---
+    {"poste": "Onduleurs hybrides Deye", "categorie": "conversion",
+     "auto": "onduleurs", "qte": 0, "pu": 1900.0, "unite": "u"},
+    # --- 3. stockage ---
+    {"poste": "Cellules LFP 314 Ah grade A", "categorie": "stockage",
+     "auto": "cellules", "qte": 0, "pu": 62.0, "unite": "u"},
+    {"poste": "BMS 16S 200 A", "categorie": "stockage",
+     "auto": "packs", "qte": 0, "pu": 240.0, "unite": "u"},
+    {"poste": "Coffrets, busbars, compression, fusibles classe T",
+     "categorie": "stockage", "auto": "packs", "qte": 0, "pu": 320.0, "unite": "u"},
+    {"poste": "Cablage batterie 95 mm2 et cosses", "categorie": "stockage",
+     "auto": "onduleurs", "qte": 0, "pu": 320.0, "unite": "u"},
+    # --- 4. cablage et protections ---
+    {"poste": "Cablage DC PV, connecteurs, chemins de cables",
+     "categorie": "electrique", "auto": "kwc", "qte": 0, "pu": 28.0, "unite": "kWc"},
+    {"poste": "Tableaux AC/DC, parafoudres, protections",
+     "categorie": "electrique", "auto": "fixe", "qte": 1, "pu": 2600.0, "unite": "lot"},
+    {"poste": "Supervision et mesure par circuit", "categorie": "electrique",
+     "auto": "fixe", "qte": 1, "pu": 600.0, "unite": "lot"},
+    # --- 5. genie civil ---
+    {"poste": "Terrassement, tranchee, liaison, mise a la terre",
+     "categorie": "genie_civil", "auto": "fixe", "qte": 1, "pu": 1800.0, "unite": "lot"},
+    # --- 6. administratif ---
+    {"poste": "Consuel, declaration prealable, convention Enedis",
+     "categorie": "admin", "auto": "fixe", "qte": 1, "pu": 400.0, "unite": "lot"},
+    # --- 9 et 10. hors perimetre solaire ---
+    {"poste": "Chauffe-eau thermodynamique 300 L", "categorie": "thermique",
+     "auto": "fixe", "qte": 1, "pu": 1900.0, "unite": "u"},
+    {"poste": "Insert bois et conduit", "categorie": "thermique",
+     "auto": "fixe", "qte": 1, "pu": 4000.0, "unite": "u"},
+    {"poste": "Isolation combles et etancheite a l'air", "categorie": "batiment",
+     "auto": "fixe", "qte": 1, "pu": 3000.0, "unite": "lot"},
 ]
+
+# Lignes proposees par le bouton "Completer la nomenclature" : tout ce qu'une
+# auto-installation consomme reellement et qu'un devis d'installateur noie
+# dans un forfait. Prix indicatifs achat direct 2025, a confirmer par devis.
+BOM_COMPLEMENT = [
+    {"poste": "Cable solaire 6 mm2 double isolation", "categorie": "electrique",
+     "auto": "fixe", "qte": 200, "pu": 1.10, "unite": "m"},
+    {"poste": "Connecteurs MC4 (paires)", "categorie": "electrique",
+     "auto": "grappes", "qte": 0, "pu": 3.50, "unite": "paire"},
+    {"poste": "Coffret DC avec sectionneur et porte-fusibles",
+     "categorie": "electrique", "auto": "fixe", "qte": 1, "pu": 190.0, "unite": "u"},
+    {"poste": "Fusibles gPV et porte-fusibles", "categorie": "electrique",
+     "auto": "grappes", "qte": 0, "pu": 9.0, "unite": "u"},
+    {"poste": "Parafoudre DC type 2", "categorie": "electrique",
+     "auto": "fixe", "qte": 1, "pu": 130.0, "unite": "u"},
+    {"poste": "Parafoudre AC type 2", "categorie": "electrique",
+     "auto": "fixe", "qte": 1, "pu": 110.0, "unite": "u"},
+    {"poste": "Disjoncteur differentiel 30 mA de tete", "categorie": "electrique",
+     "auto": "onduleurs", "qte": 0, "pu": 95.0, "unite": "u"},
+    {"poste": "Cable AC cuivre onduleurs vers tableau", "categorie": "electrique",
+     "auto": "fixe", "qte": 30, "pu": 7.50, "unite": "m"},
+    {"poste": "Piquet de terre, conducteur vert-jaune, barrette",
+     "categorie": "electrique", "auto": "fixe", "qte": 1, "pu": 160.0, "unite": "lot"},
+    {"poste": "Routeur de surplus vers ballon ECS", "categorie": "electrique",
+     "auto": "fixe", "qte": 1, "pu": 320.0, "unite": "u"},
+    {"poste": "Sertisseuse hydraulique et cosses cuivre", "categorie": "outillage",
+     "auto": "fixe", "qte": 1, "pu": 120.0, "unite": "u"},
+    {"poste": "Pince MC4, denudeur, multimetre CAT III",
+     "categorie": "outillage", "auto": "fixe", "qte": 1, "pu": 150.0, "unite": "lot"},
+    {"poste": "Pince ampermetrique courant continu", "categorie": "outillage",
+     "auto": "fixe", "qte": 1, "pu": 90.0, "unite": "u"},
+    {"poste": "Cle dynamometrique et douilles", "categorie": "outillage",
+     "auto": "fixe", "qte": 1, "pu": 70.0, "unite": "u"},
+    {"poste": "EPI : gants isolants, lunettes, chaussures, harnais",
+     "categorie": "outillage", "auto": "fixe", "qte": 1, "pu": 220.0, "unite": "lot"},
+    {"poste": "Chargeur d'equilibrage des cellules (top balancing)",
+     "categorie": "outillage", "auto": "fixe", "qte": 1, "pu": 80.0, "unite": "u"},
+    {"poste": "Extension d'assurance multirisque habitation",
+     "categorie": "admin", "auto": "fixe", "qte": 1, "pu": 60.0, "unite": "an"},
+]
+
 
 
 # --------------------------------------------------------------------------
@@ -951,6 +1219,11 @@ def load_config(path: str) -> dict:
                 ch.get("n_panneaux", 1), float(ch.get("voc_v", 49.5)),
                 float(cfg["module"].get("beta_voc_pct_k", -0.27)),
                 float(cfg["systeme"].get("vdc_max_v", 800.0)))
+    # completion des lignes de nomenclature enregistrees avant les categories
+    for l in cfg["bom"]:
+        if not l.get("categorie") or l["categorie"] not in BOM_CATEGORIES:
+            l["categorie"] = deviner_categorie(l.get("poste", ""),
+                                               l.get("auto", "fixe"))
     # completion des parametres manquants dans les postes
     for p in cfg["postes"]:
         d = LOAD_KINDS.get(p.get("kind", "generique"), LOAD_KINDS["generique"])["defaults"]

@@ -25,6 +25,8 @@ python main.py                     # interface graphique, config par défaut
 python main.py ma_config.json      # interface graphique, config existante
 python main.py --cli               # rapport texte complet dans le terminal
 python main.py --sweep inclinaison 20,30,40,50,60,70,80
+python main.py --grille 5:40@5 0:128@16 10          # optimum PV x batterie
+python main.py --grille 5:40@5 0:128@16 10          # optimum PV x batterie
 python main.py --download 45.76 4.83 2018 2023      # nouvelle météo PVGIS
 ```
 
@@ -104,7 +106,7 @@ sur l'appoint électrique, nombre de cycles batterie et durée de vie estimée.
 
 ---
 
-## Les sept onglets
+## Les neuf onglets
 
 1. **Site et météo** — coordonnées, années, base PVGIS, téléchargement,
    paramètres modules. Graphique du rayonnement et de la température mensuels.
@@ -116,18 +118,162 @@ sur l'appoint électrique, nombre de cycles batterie et durée de vie estimée.
    droite, totaux simulés en bas.
 4. **Onduleurs et batterie** — tous les rendements et la courbe d'état de
    charge sur toute la série horaire.
-5. **Coûts** — nomenclature éditable. La colonne *quantité auto* relie chaque
-   ligne à la configuration : panneaux, onduleurs, cellules, packs, kWc,
-   surface. Modifier le nombre de panneaux mémorise le coût automatiquement.
+5. **Coûts** — nomenclature éditable, **rangée en deux périmètres**. Chaque
+   ligne porte une catégorie : *modules et structure*, *onduleurs*, *batterie
+   et BMS*, *câblage et protections*, *génie civil*, *administratif*,
+   *outillage* forment le **périmètre de l'installation solaire** ; *thermique*
+   (chauffe-eau, insert), *bâtiment* (isolation) et *autre* en sont exclus.
+   Seul le sous-total solaire alimente les €/Wc, le €/kWh de batterie, le coût
+   du kWh autoproduit et les coûts affichés dans les onglets Optimisation,
+   Orientations et Leviers — le prix d'une isolation de combles n'a rien à
+   faire dans l'arbitrage d'un pack de batterie. La colonne *quantité auto*
+   relie chaque ligne à la configuration : panneaux, onduleurs, cellules,
+   packs, grappes, kWc, surface. Un bouton *Compléter la nomenclature* ajoute
+   les postes qu'une auto-installation oublie systématiquement : câble solaire
+   au mètre, MC4, coffret DC, fusibles de grappe, parafoudres, mise à la
+   terre, puis l'outillage — sertisseuse, pince MC4, pince ampèremétrique
+   continue, EPI, chargeur d'équilibrage.
 6. **Résultats** — bilan mensuel, détail jour par jour pour un mois et une
    année au choix, et la journée moyenne de chaque mois en profil horaire.
 7. **Optimisation** — balayage d'un paramètre (inclinaison, puissance crête,
-   batterie, onduleurs) avec repérage automatique de l'optimum, et calcul du
-   **budget de consommation** : pour chaque mois, la consommation journalière
-   maximale compatible avec l'objectif d'autonomie.
+   batterie, onduleurs) et calcul du **budget de consommation** : pour chaque
+   mois, la consommation journalière maximale compatible avec l'objectif
+   d'autonomie. Quatre vues : les profils mois par mois de chaque option, des
+   histogrammes qui comparent les options entre elles (économie et temps de
+   retour compris), l'**amortissement tranche par tranche**, et la recherche
+   d'**optimum puissance PV × batterie**.
+8. **Orientations** — recherche de l'inclinaison et de l'azimut de chaque
+   groupe pour un critère au choix, avec la carte du critère par groupe.
+9. **Leviers** — par quoi commencer pour payer moins de réseau : l'énergie
+   achetée est imputée à chaque poste de consommation (avec la part consommée
+   la nuit, celle qui coûte le plus cher), puis chaque action envisageable
+   — panneaux, batterie, onduleur, poste allégé de 10 %, usage décalé au
+   soleil, appareil de fond remplacé — est réellement simulée et classée par
+   gain annuel, coût et temps de retour.
+
+Tous les graphiques réagissent au survol (réticule et valeurs de toutes les
+courbes) et s'ouvrent en plein écran d'un clic, avec la légende complète, les
+valeurs sous le curseur et le minimum, la moyenne, le maximum et le total de
+chaque courbe.
 
 `F5` relance la simulation. Le bouton *Exporter CSV* sort le bilan mensuel,
 tous les indicateurs et l'intégralité du détail journalier.
+
+---
+
+## Deux périmètres de coût, et pourquoi ça change les conclusions
+
+La nomenclature mélange deux choses de nature différente : ce qui produit et
+stocke l'électricité, et ce qui fait baisser le besoin (chauffe-eau
+thermodynamique, insert, isolation). Les confondre dans un total unique fausse
+tout arbitrage de dimensionnement.
+
+Le simulateur les sépare et affiche les deux :
+
+| | Installation solaire | Projet complet |
+|---|---|---|
+| Investissement | catégories 1 à 8 de la nomenclature | tout le devis |
+| Comparé à | la **même maison** sans panneaux ni batterie | la **facture déclarée** avant travaux |
+| Économie annuelle | l'énergie que le PV et la batterie évitent d'acheter | la baisse totale de la facture |
+| Sert à | **dimensionner** : un panneau, un pack, un onduleur de plus | **budgéter** le chantier |
+
+C'est le couple de gauche qui pilote tout le reste. Sur la configuration par
+défaut, cela fait 25 288 € de solaire face à 34 188 € de projet : le ratio
+passe de 1,14 à **0,84 €/Wc**, la valeur réellement comparable aux 1,80 à
+2,50 €/Wc d'une pose par un installateur.
+
+Le balayage de batterie devient lisible directement :
+
+```
+    valeur  autonomie  cout sol.  EUR/Wc   retour  ROI marg.
+        16     66.44%      20632    0.69      7.2      -
+        32     76.68%      22184    0.74      6.7    0.268
+        64     86.33%      25288    0.84      6.7    0.126
+        96     89.40%      28392    0.95      7.2    0.040
+       128     90.72%      31496    1.05      7.8    0.017
+```
+
+La colonne *ROI marginal* est le critère d'arrêt : 0,268 en passant de 16 à
+32 kWh (l'incrément se rembourse en moins de 4 ans), 0,040 en passant de 64 à
+96 kWh (25 ans), 0,017 au-delà. Le pack suivant n'en vaut plus la peine bien
+avant que la courbe d'autonomie ne s'aplatisse.
+
+Dans l'onglet **Leviers**, une colonne *Périmètre* dit pour chaque action si
+son surcoût tombe dans l'installation solaire, hors périmètre (un appareil, des
+travaux) ou s'il est nul (un simple réglage).
+
+---
+
+## Jusqu'où agrandir ? L'amortissement tranche par tranche
+
+Le temps de retour habituel porte sur l'installation entière. C'est une
+moyenne, et elle ment par omission : une première batterie amortie en 2 ans
+suivie d'une quatrième qui ne s'amortira jamais donnent un retour global
+flatteur, qui reste bon longtemps après que la tranche suivante a cessé d'être
+rentable.
+
+L'onglet 7 chiffre donc chaque tranche **seule**, indépendamment de tout ce qui
+a été installé avant :
+
+```
+  valeur  autonomie  cout sol.  retour cum |  tranche  cout tr.  gain tr.  RETOUR TR.
+       0     45.33%      19080         9.5 |        -         -         -           -
+      16     66.38%      20632         7.2 |      +16      1552       856         1.8
+      32     76.68%      22184         6.7 |      +16      1552       419         3.5
+      48     82.85%      23736         6.6 |      +16      1552       251         5.6
+      64     86.33%      25288         6.7 |      +16      1552       142         9.3
+      80     88.20%      26840         6.9 |      +16      1552        76        15.2
+      96     89.40%      28392         7.2 |      +16      1552        49        20.9
+     112     90.21%      29944         7.5 |      +16      1552        33      >horiz
+     128     90.72%      31496         7.8 |      +16      1552        21      >horiz
+```
+
+Le retour cumulé ne quitte jamais la fourchette 6,6 à 9,5 ans. Le retour de la
+tranche, lui, passe de **1,8 an à jamais** : le 7ᵉ pack de batterie ne se
+remboursera pas dans l'horizon d'analyse, et cela ne se voit que dans cette
+colonne. Un seuil réglable dans la barre du haut (*tranche à rembourser en
+moins de N ans*) sert de critère d'arrêt.
+
+## Optimum puissance PV × batterie
+
+Panneaux et batterie ne se dimensionnent pas l'un après l'autre : des panneaux
+sans batterie produisent un surplus qu'on jette, une batterie sans panneaux n'a
+rien à stocker. Le sous-onglet *Optimum PV × batterie* simule la grille
+complète — une simulation dure moins d'un dixième de seconde, une grille de
+72 points prend 7 secondes — et affiche la carte du critère choisi.
+
+Le résultat dépend fortement du critère, et c'est le point :
+
+| Critère | Résultat | Coût | Autonomie |
+|---|---|---|---|
+| Gain cumulé sur 25 ans | 40 kWc / 112 kWh | 33 024 € | 94,0 % |
+| Temps de retour le plus court | 15 kWc / 32 kWh | 17 564 € | 66,8 % |
+| Autonomie max., tranches rentables | 25 kWc / 48 kWh | 22 196 € | 80,3 % |
+
+Surtout, le **chemin de croissance** donne l'ordre dans lequel agrandir. À
+chaque étape il compare les deux seules décisions possibles — un cran de
+panneaux ou un cran de batterie — retient celle qui se rembourse le plus vite,
+et s'arrête dès qu'elle dépasse le seuil :
+
+```
+  etape                      kWc    kWh   cumul    cout  gain/an  retour  autonomie
+  Point de depart            5.0      0   11380       -        -       -     27.5 %
+  +5.0 kWc de panneaux      10.0      0   12920    1540      343     4.5     36.0 %
+  +16 kWh de batterie       10.0     16   14472    1552      666     2.3     52.3 %
+  +5.0 kWc de panneaux      15.0     16   16012    1540      281     5.5     59.2 %
+  +16 kWh de batterie       15.0     32   17564    1552      309     5.0     66.8 %
+  +5.0 kWc de panneaux      20.0     32   19104    1540      198     7.8     71.7 %
+  +16 kWh de batterie       20.0     48   20656    1552      194     8.0     76.4 %
+  +5.0 kWc de panneaux      25.0     48   22196    1540      156     9.9     80.3 %
+  -> la tranche suivante mettrait 12,7 ans : on s'arrete la.
+```
+
+C'est la vue à utiliser pour un projet que l'on fait grossir par étapes.
+Disponible aussi en ligne de commande :
+
+```bash
+python main.py --grille 5:40@5 0:128@16 10      # puissances, capacités, seuil
+```
 
 ---
 
@@ -163,6 +309,36 @@ mois sur douze, est le report jour/nuit, pas le gisement.
 
 Vérifiez-le vous-même : onglet 7, *Inclinaison de tous les champs*, valeurs
 `20, 30, 40, 50, 60, 70, 80`.
+
+---
+
+## Ce qui a été corrigé dans le moteur
+
+Une relecture systématique a mis au jour des grandeurs qui s'affichaient
+fausses **sans aucun signe**. Chacune est désormais couverte par un test de
+non-régression (`tests/test_moteur.py`).
+
+| Symptôme | Cause | Effet |
+|---|---|---|
+| Autonomie **négative** dès que *Recharge réseau en HC* est cochée | l'énergie achetée la nuit pour remplir la batterie était comptée à l'achat, puis rendue « autonome » à la restitution | l'origine de l'énergie stockée est maintenant suivie ; sans panneaux l'autonomie vaut 0 %, pas −6,5 % |
+| Colonne *Budget conso/jour* : 4,1 kWh/j en janvier pour une autonomie réelle de 2,7 % | la dichotomie renvoyait sa borne basse comme un résultat | les bornes sont vérifiées ; un mois hors d'atteinte affiche `-` en rouge |
+| Pompe de piscine de 750 W appelant **1 125 W** | l'énergie journalière était étalée sur le profil sans plafond de puissance | la puissance est plafonnée, le débordement reporté sur les heures voisines et signalé |
+| Consigne de chauffage sans aucun effet | `t_consigne` n'était lu nulle part | la consigne décale la température de non-chauffage ; à 19,5 °C (la référence) rien ne change pour les configurations existantes |
+| Température lissée à 3,9 °C pour 8,1 °C réels en début de série | `np.convolve(mode="same")` complète par des zéros | bords prolongés par la valeur extrême |
+| Véhicule censé charger du lundi au jeudi, chargeant du dimanche au mercredi | décalage de jour de semaine faux d'une unité | corrigé |
+| Deux groupes PV de même nom : un seul dans le détail | indexation par le nom | les doublons sont désambiguïsés |
+| Poste de 2 500 kWh/an ressortant à 0 kWh/an | douze poids mensuels à zéro faisaient disparaître l'énergie | répartition uniforme de repli |
+| Poste dont le *type* est inconnu : ignoré en silence | | affiché à zéro **et** signalé en erreur |
+| Batterie de 8 kWh **gratuite** dans le devis | arrondi au plus proche du nombre de packs | arrondi au supérieur, tolérance de 2 % |
+| Ligne de devis mise volontairement à 0 : facturée 1 | règle « quantité nulle = 1 » | un zéro explicite vaut zéro, une clé absente vaut 1 |
+| *ROI marginal* à 0,000 sur tout un balayage d'inclinaison | le coût ne change pas : le rapport n'existe pas | affiche `-` |
+| « durée de vie estimée 6 000 ans », « 2,5e13 EUR/kWh » | divisions non gardées | affiche `-` |
+| Cycles batterie sous-estimés de 7 % | énergie comptée côté alternatif, capacité aux bornes | ramenés au même point de mesure |
+| L'« optimum » d'un balayage toujours égal à la plus grande valeur testée | critère = autonomie maximale, qui croît toujours | le **gain cumulé sur l'horizon** est affiché à côté : lui sait s'arrêter |
+
+Deux hypothèses économiques ont aussi été rectifiées : le scénario « sans PV »
+comptait la veille des onduleurs, qui n'existerait pas sans onduleurs, et il
+oubliait le bois que la maison brûlerait de toute façon.
 
 ---
 
