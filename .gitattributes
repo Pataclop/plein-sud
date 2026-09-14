@@ -1,2 +1,13 @@
-# Auto detect text files and perform LF normalization
+# Normalisation des fins de ligne
 * text=auto
+
+*.py   text diff=python
+*.md   text
+*.json text
+*.yml  text
+
+# Binaires : aucune transformation
+*.png  binary
+*.ico  binary
+*.icns binary
+*.gz   binary

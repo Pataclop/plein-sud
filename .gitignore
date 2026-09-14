@@ -1,3 +1,24 @@
+# Python
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Builds PyInstaller
+build/
+dist/
+
+# Systeme
 .DS_Store
+Thumbs.db
+
+# Configurations locales : seule la configuration d'exemple est versionnee
+/*.json
+!/config_defaut.json
+
+# Meteo telechargee depuis PVGIS (les deux series livrees sont suivies a part)
+pv_sizer/data/*.csv.gz
+!pv_sizer/data/meteo_langoiran_2018_2023.csv.gz
+!pv_sizer/data/meteo_44.716_-0.415_2018_2023_sarah3.csv.gz

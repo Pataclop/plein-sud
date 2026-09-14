@@ -1,0 +1,89 @@
+name: Executables
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.nom }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            nom: Windows
+            artefact: PleinSud-windows.exe
+          - os: macos-latest
+            nom: macOS Apple Silicon
+            artefact: PleinSud-macos-arm64.zip
+          - os: macos-13
+            nom: macOS Intel
+            artefact: PleinSud-macos-intel.zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Dependances
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Icone macOS native
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p PleinSud.iconset
+          for paire in "16 icon_16x16" "32 icon_16x16@2x" "32 icon_32x32" \
+                       "64 icon_32x32@2x" "128 icon_128x128" "256 icon_128x128@2x" \
+                       "256 icon_256x256" "512 icon_256x256@2x" "512 icon_512x512" \
+                       "1024 icon_512x512@2x"; do
+            set -- $paire
+            sips -z "$1" "$1" assets/logo-1024.png --out "PleinSud.iconset/$2.png" >/dev/null
+          done
+          iconutil -c icns PleinSud.iconset -o assets/logo.icns
+          rm -rf PleinSud.iconset
+
+      - name: Construire
+        run: pyinstaller --noconfirm PleinSud.spec
+
+      - name: Empaqueter (Windows)
+        if: runner.os == 'Windows'
+        run: Move-Item dist/PleinSud.exe dist/${{ matrix.artefact }}
+
+      - name: Empaqueter (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          xattr -cr dist/PleinSud.app
+          cd dist && zip -qry "${{ matrix.artefact }}" PleinSud.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artefact }}
+          path: dist/${{ matrix.artefact }}
+          if-no-files-found: error
+
+  publier:
+    name: Publier la release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artefacts
+          merge-multiple: true
+      - name: Creer la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artefacts/* \
+            --title "Plein Sud $GITHUB_REF_NAME" \
+            --generate-notes

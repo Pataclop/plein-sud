@@ -1,20 +1,8 @@
-# Simulateur de dimensionnement PV + stockage LFP
+# Plein Sud — le modèle en détail
 
-Simulation **au pas horaire sur 6 années de météo réelle** d'une installation
-photovoltaïque avec batterie, en autoconsommation. Conçu pour arbitrer entre
-inclinaison, puissance crête, capacité de batterie et nombre d'onduleurs, et
-pour chiffrer le résultat.
-
----
-
-## Installation
-
-```bash
-pip install PyQt6 matplotlib numpy
-python main.py
-```
-
-Aucune autre dépendance. Testé avec Python 3.11+.
+Ce document décrit ce que calcule le simulateur, poste par poste, et les choix
+de modélisation derrière chaque chiffre. Pour l'installation et la prise en
+main, voir le [README](../README.md).
 
 ---
 
@@ -25,7 +13,6 @@ python main.py                     # interface graphique, config par défaut
 python main.py ma_config.json      # interface graphique, config existante
 python main.py --cli               # rapport texte complet dans le terminal
 python main.py --sweep inclinaison 20,30,40,50,60,70,80
-python main.py --grille 5:40@5 0:128@16 10          # optimum PV x batterie
 python main.py --grille 5:40@5 0:128@16 10          # optimum PV x batterie
 python main.py --download 45.76 4.83 2018 2023      # nouvelle météo PVGIS
 ```
