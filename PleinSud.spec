@@ -7,10 +7,15 @@ Windows produit un executable unique dist/PleinSud.exe ; macOS produit un
 paquet dist/PleinSud.app. Les series meteo livrees, l'icone et la
 configuration d'exemple sont embarquees.
 """
+import re
 import sys
 
 MAC = sys.platform == "darwin"
 ICONE = "assets/logo.icns" if MAC else "assets/logo.ico"
+
+# la version vit dans pv_sizer/__init__.py et nulle part ailleurs
+VERSION = re.search(r'__version__ = "([^"]+)"',
+                    open("pv_sizer/__init__.py", encoding="utf-8").read()).group(1)
 
 a = Analysis(
     ["main.py"],
@@ -40,7 +45,7 @@ if MAC:
                  info_plist={
                      "CFBundleName": "Plein Sud",
                      "CFBundleDisplayName": "Plein Sud",
-                     "CFBundleShortVersionString": "1.0.0",
+                     "CFBundleShortVersionString": VERSION,
                      "NSHighResolutionCapable": True,
                  })
 else:
