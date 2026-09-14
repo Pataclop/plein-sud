@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+# Les tests importent le paquet depuis la racine du depot, sans installation.
+pythonpath = ["."]
+testpaths = ["tests"]
