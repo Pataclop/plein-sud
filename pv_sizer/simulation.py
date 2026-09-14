@@ -7,7 +7,8 @@ import math
 import re
 import numpy as np
 
-from .config import BOM_CATEGORIES, ORDRE_CATEGORIES, est_solaire
+from .config import (BOM_CATEGORIES, ORDRE_CATEGORIES, est_solaire,
+                     MODE_BESOIN_ENVELOPPE, IMPOT_PLUS_VALUES)
 from .solar import field_dc_power
 from .loads import build_load
 
@@ -46,8 +47,36 @@ def compute_production(cfg: dict, meteo: dict):
     return total, par_champ, diags
 
 
-#: energie d'un pack 16S de cellules LFP 314 Ah : 16 x 3,2 V x 314 Ah
+#: energie d'un pack 16S de cellules LFP 314 Ah : 16 x 3,2 V x 314 Ah.
+#: Valeur de repli quand la configuration ne decrit pas ses cellules.
 KWH_PAR_PACK_16S = 16.07
+
+
+def cellules_par_pack(cfg: dict) -> int:
+    """Nombre de cellules en serie dans un pack (16S par defaut)."""
+    try:
+        n = int(cfg["systeme"].get("cell_n_serie", 16))
+    except (TypeError, ValueError, KeyError):
+        return 16
+    return n if n > 0 else 16
+
+
+def kwh_par_pack(cfg: dict) -> float:
+    """Energie d'un pack, deduite de la composition des cellules saisie dans
+    l'onglet 4 : cellules en serie x tension nominale x capacite en Ah.
+
+    Sert a chiffrer les packs, les BMS et les cellules de la nomenclature, et
+    a dimensionner le levier "+1 pack batterie". La capacite nominale de la
+    batterie reste saisie a part : c'est elle que le moteur simule."""
+    sys = cfg.get("systeme", {})
+    try:
+        ah = float(sys.get("cell_ah", 314.0))
+        v = float(sys.get("cell_v_nom", 3.2))
+    except (TypeError, ValueError):
+        return KWH_PAR_PACK_16S
+    kwh = cellules_par_pack(cfg) * v * ah / 1000.0
+    # une saisie a zero ne doit pas faire exploser le calcul du nombre de packs
+    return kwh if kwh > 0 else KWH_PAR_PACK_16S
 
 
 def total_kwc(cfg: dict) -> float:
@@ -430,7 +459,8 @@ def bom_quantities(cfg: dict) -> dict:
     # (0 pack, 0 cellule, 0 BMS). La tolerance de 2 % absorbe le fait qu'une
     # capacite se saisit arrondie : 64,3 kWh, ce sont bien 4 packs de 16,07
     # et non 5.
-    packs = int(math.ceil(batt / KWH_PAR_PACK_16S - 0.02)) if batt > 0 else 0
+    pack = kwh_par_pack(cfg)
+    packs = int(math.ceil(batt / pack - 0.02)) if batt > 0 else 0
     packs = max(packs, 1 if batt > 0 else 0)
     return {
         "fixe": 1.0,
@@ -439,7 +469,7 @@ def bom_quantities(cfg: dict) -> dict:
         "onduleurs": float(cfg["systeme"]["n_onduleurs"]),
         "batt_kwh": batt,
         "packs": float(packs),
-        "cellules": float(packs * 16),
+        "cellules": float(packs * cellules_par_pack(cfg)),
         "m2_panneaux": surface_m2(cfg),
         "grappes": float(round(total_grappes(cfg))),
     }
@@ -1121,6 +1151,21 @@ LEVIER_REDUCTION = {
 PROFILS_SOLAIRES = ("solaire", "solaire_large", "jour")
 
 
+def levier_reduction(poste: dict):
+    """Parametre a diminuer pour ce poste, et sa designation en francais.
+
+    Un poste de chauffage decrit par son enveloppe ignore le besoin annuel
+    saisi : reduire cette valeur ne changerait rien au resultat et le levier
+    sortirait a zero sans explication. On agit alors sur le correctif de
+    deperditions, ce qui revient a isoler le logement.
+    """
+    params = poste.get("params", {})
+    if poste.get("kind") == "chauffage" and \
+            str(params.get("mode_besoin")) == MODE_BESOIN_ENVELOPPE:
+        return "correctif_deperditions", "les deperditions de l'enveloppe"
+    return LEVIER_REDUCTION.get(poste.get("kind", "generique"))
+
+
 def _mettre_a_l_echelle(params: dict, cle: str, facteur: float) -> bool:
     """Multiplie un parametre (scalaire ou liste de 12 mois) par un facteur."""
     if cle not in params:
@@ -1157,7 +1202,7 @@ def _variantes_leviers(cfg, reduction, talon_w, cout_remplacement):
                       f"cablage compris. Le cout vient de la nomenclature.",
                       ajoute, None))
 
-    pack = KWH_PAR_PACK_16S
+    pack = kwh_par_pack(cfg)
     for n in (1, 2):
         def batterie(c, n=n, pack=pack):
             c["systeme"]["batt_kwh_nominal"] = float(
@@ -1178,9 +1223,8 @@ def _variantes_leviers(cfg, reduction, talon_w, cout_remplacement):
     for i, p in enumerate(cfg["postes"]):
         if not p.get("actif", True):
             continue
-        kind = p.get("kind", "generique")
         nom = p["nom"]
-        cle_lib = LEVIER_REDUCTION.get(kind)
+        cle_lib = levier_reduction(p)
         if cle_lib:
             cle, libelle = cle_lib
 
@@ -1556,6 +1600,21 @@ def parse_sweep_values(raw) -> list[float]:
     return vals
 
 
+def horizon_tranches(cfg: dict) -> int:
+    """Duree sur laquelle une TRANCHE est jugee, en annees.
+
+    Volontairement distincte de l'horizon d'analyse du projet entier : on
+    accorde 25 ans a des panneaux garantis 25 ans, mais on n'attend pas
+    aussi longtemps pour decider d'un pack de batterie de plus, qui sera
+    probablement remplace avant. Une tranche non remboursee dans cette
+    duree est comptee comme non remboursee."""
+    e = cfg.get("economie", {})
+    v = e.get("horizon_tranche_ans")
+    if v is None:
+        v = e.get("duree_analyse_ans", 10)
+    return max(int(v), 1)
+
+
 #: etats possibles d'une tranche, et ce qu'ils veulent dire pour la decision
 TRANCHE_STATUTS = {
     "depart": "Point de depart du balayage, pas de tranche avant lui.",
@@ -1591,7 +1650,7 @@ def tranches_successives(out: list[dict], cfg: dict,
     """
     e = cfg["economie"]
     infl = float(e.get("inflation_energie", 0.0))
-    horizon = int(e.get("duree_analyse_ans", 25))
+    horizon = horizon_tranches(cfg)
     if out and key not in out[0]:
         key = "economie_vs_actuel"
 
@@ -1643,6 +1702,183 @@ def derniere_tranche_rentable(out: list[dict], seuil_ans: float = None):
         if r is None:
             break
         if seuil_ans is not None and r > seuil_ans:
+            break
+        dernier = i
+    return dernier
+
+
+# --------------------------------------------------------------------------
+# Comparaison avec un placement financier
+# --------------------------------------------------------------------------
+def taux_net_annualise(taux: float, impot: float, horizon: int) -> float:
+    """Rendement annuel d'un placement une fois l'impot de sortie paye.
+
+    Un placement a 14,5 %/an dont les gains sont amputes de 30 % a la revente
+    ne rapporte pas 14,5 % : l'impot ne frappe qu'a la fin, sur la plus-value
+    cumulee. Le taux equivalent depend donc de la duree de detention."""
+    horizon = max(int(horizon), 1)
+    brut = (1.0 + float(taux)) ** horizon
+    net = 1.0 + (brut - 1.0) * (1.0 - float(impot))
+    return net ** (1.0 / horizon) - 1.0
+
+
+def gains_placement(capex: float, taux: float, impot: float,
+                    horizon: int) -> list[float]:
+    """Plus-value nette d'impot d'un placement de `capex` euros, annee par
+    annee de 0 a l'horizon. Le capital, lui, reste disponible : c'est la
+    difference de fond avec du materiel, qui ne vaut plus rien au bout.
+
+    La capitalisation se fait au taux NET : l'impot de sortie est ainsi
+    reparti sur toute la duree au lieu de tomber d'un coup la derniere annee,
+    ce qui rend l'annee de croisement lisible. Au bout de l'horizon, le
+    montant est exactement celui de l'impot paye a la revente."""
+    capex = float(capex)
+    net = taux_net_annualise(taux, impot, horizon)
+    return [capex * ((1.0 + net) ** a - 1.0) for a in range(int(horizon) + 1)]
+
+
+def cumul_tranche(cout: float, gain_an: float, infl: float, horizon: int,
+                  reinvest: float = 0.0) -> list[float]:
+    """Position nette d'une tranche annee par annee : on part de -cout, puis
+    chaque annee ajoute l'economie d'energie, inflation comprise.
+
+    `reinvest` place les economies deja encaissees au lieu de les laisser
+    dormir. Sans lui, la comparaison avec un placement serait biaisee et
+    contredirait le TRI : l'argent rendu chaque annee par la tranche peut
+    lui aussi travailler. Le mettre a zero donne le cumul brut, celui de la
+    vue Amortissement par tranche."""
+    cout = float(cout)
+    acquis = 0.0
+    serie = [-cout]
+    for a in range(1, int(horizon) + 1):
+        acquis = acquis * (1.0 + float(reinvest)) \
+            + float(gain_an) * (1.0 + float(infl)) ** (a - 1)
+        serie.append(acquis - cout)
+    return serie
+
+
+def tri_tranche(cout: float, gain_an: float, infl: float,
+                horizon: int, plafond: float = 1.0):
+    """Taux de rendement interne d'une tranche, sur l'horizon d'analyse.
+
+    C'est le taux qu'il faudrait obtenir en bourse pour faire aussi bien que
+    cette tranche : au-dessus, le placement gagne ; en dessous, la tranche.
+    Retourne None si la tranche ne rembourse meme pas son cout nominal, et
+    plafonne a `plafond` pour une tranche gratuite ou quasi gratuite."""
+    cout = float(cout); gain_an = float(gain_an)
+    horizon = max(int(horizon), 1)
+    if gain_an <= 0:
+        return None
+    if cout <= 1e-9:
+        return plafond
+
+    def van(t):
+        return sum(gain_an * (1.0 + infl) ** (a - 1) / (1.0 + t) ** a
+                   for a in range(1, horizon + 1)) - cout
+
+    if van(0.0) < 0:
+        return None                    # jamais rembourse, meme sans exigence
+    if van(plafond) > 0:
+        return plafond
+    lo, hi = 0.0, plafond
+    for _ in range(80):
+        mid = (lo + hi) / 2.0
+        if van(mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
+
+
+def croisements(cum_sol: list[float], gains_b: list[float]):
+    """Qui est devant a la fin, et depuis quand.
+
+    Retourne (annee_bascule, annee_perte), dont une seule est renseignee :
+
+      * annee_bascule : la tranche passe devant le placement a cette annee-la
+        et le reste jusqu'a l'horizon ;
+      * annee_perte : le placement repasse devant a cette annee-la et le reste.
+
+    Les deux courbes se croisent en general DEUX fois : le placement demarre
+    doucement, la tranche prend l'avantage des qu'elle est remboursee, puis la
+    capitalisation finit par repasser devant. C'est le DERNIER croisement qui
+    decide, pas le premier."""
+    n = min(len(cum_sol), len(gains_b))
+    if n == 0:
+        return None, None
+    d = [cum_sol[a] - gains_b[a] for a in range(n)]
+    for a in range(n - 1, 0, -1):
+        if (d[a] >= 0) != (d[a - 1] >= 0):
+            x = ((a - 1) + (-d[a - 1] / (d[a] - d[a - 1]))
+                 if d[a] != d[a - 1] else float(a))
+            return (x, None) if d[-1] >= 0 else (None, x)
+    # aucun changement de signe : le meme est devant du premier au dernier jour
+    return (0.0, None) if d[-1] >= 0 else (None, 0.0)
+
+
+def comparer_placement(out: list[dict], cfg: dict, taux: float,
+                       impot: float = IMPOT_PLUS_VALUES) -> list[dict]:
+    """Oppose chaque tranche a un placement du meme montant.
+
+    La question tranchee est celle-ci : ces euros-la, vaut-il mieux les mettre
+    dans une tranche de plus ou les placer ? Le materiel est suppose sans
+    valeur de revente a l'horizon, le capital place est suppose recupere.
+
+    Ajoute a chaque point : tri_tranche (taux de rendement interne),
+    gain_bourse (plus-value nette du placement a l'horizon), ecart_bourse
+    (tranche moins placement, en euros a l'horizon), annee_bascule,
+    annee_perte et bat_bourse."""
+    e = cfg["economie"]
+    infl = float(e.get("inflation_energie", 0.0))
+    horizon = horizon_tranches(cfg)
+    net = taux_net_annualise(taux, impot, horizon)
+    vide = {"tri_tranche": None, "gain_tranche_replace": None,
+            "gain_bourse": None, "ecart_bourse": None,
+            "annee_bascule": None, "annee_perte": None, "bat_bourse": None,
+            "cumul_tranche": None, "cumul_bourse": None}
+    res = []
+    for o in out:
+        statut = o.get("statut", "depart")
+        cout = o.get("cout_tranche")
+        gain = o.get("gain_tranche")
+        if statut in ("depart", "sans_surcout") or cout is None or gain is None:
+            res.append(dict(vide))
+            continue
+        # les economies de la tranche sont replacees au meme taux que le
+        # placement auquel on l'oppose : sinon on comparerait un capital qui
+        # travaille a des euros qui dorment dans un tiroir
+        cum_sol = cumul_tranche(cout, gain, infl, horizon, reinvest=net)
+        gains_b = gains_placement(cout, taux, impot, horizon)
+        ecart = cum_sol[-1] - gains_b[-1]
+        bascule, perte = croisements(cum_sol, gains_b)
+        res.append({
+            "tri_tranche": tri_tranche(cout, gain, infl, horizon),
+            "gain_tranche_replace": cum_sol[-1],
+            "gain_bourse": gains_b[-1],
+            "ecart_bourse": ecart,
+            "annee_bascule": bascule,
+            "annee_perte": perte,
+            "bat_bourse": bool(ecart > 0),
+            "cumul_tranche": cum_sol,
+            "cumul_bourse": gains_b,
+        })
+    return res
+
+
+def derniere_tranche_vs_placement(out: list[dict]):
+    """Indice du dernier point dont la tranche bat encore le placement.
+
+    Meme logique que derniere_tranche_rentable : on s'arrete a la premiere
+    tranche qui perd, car les suivantes sont toujours moins bonnes."""
+    dernier = None
+    for i, o in enumerate(out):
+        if o.get("statut") == "depart":
+            dernier = i
+            continue
+        if o.get("statut") == "sans_surcout":
+            dernier = i
+            continue
+        if not o.get("bat_bourse"):
             break
         dernier = i
     return dernier

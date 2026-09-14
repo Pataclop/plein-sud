@@ -10,10 +10,19 @@ Format d'une ligne de schema :
 L'aide est affichee en infobulle au survol du libelle ET du champ.
 """
 from __future__ import annotations
-import json, os, copy, datetime, unicodedata
+import json, os, sys, copy, datetime, unicodedata
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(APP_DIR, "data")
+
+# En executable PyInstaller, le dossier du programme est en lecture seule et
+# peut disparaitre a la fermeture : les meteo telechargees vont donc dans le
+# dossier personnel, les fichiers livres restent lus la ou ils sont empaquetes.
+_FIGE = getattr(sys, "frozen", False)
+BUNDLED_DATA_DIR = os.path.join(APP_DIR, "data")
+DATA_DIR = (os.path.join(os.path.expanduser("~"), ".plein-sud", "data")
+            if _FIGE else BUNDLED_DATA_DIR)
+RACINE = os.path.dirname(APP_DIR)          # depot en dev, bundle en executable
+ICONE = os.path.join(RACINE, "assets", "logo-256.png")
 
 
 # --------------------------------------------------------------------------
@@ -139,6 +148,178 @@ AIDE_POIDS_MENSUELS = ("<b>Ponderation relative de chaque mois (sans unite).</b>
 
 
 # --------------------------------------------------------------------------
+# Enveloppe du batiment : tables d'isolation
+#   Le besoin de chauffage n'est pas une donnee que l'on connait : c'est un
+#   resultat. On sait le calculer par la methode des degres-heures, a partir
+#   du coefficient de deperdition UA du logement (watts perdus par degre
+#   d'ecart avec l'exterieur) et de la temperature reelle de la serie meteo.
+#
+#   UA = somme des (surface x U) de chaque paroi, + ponts thermiques,
+#        + renouvellement d'air.
+#   U = coefficient de transmission thermique d'une paroi, en W/m2/K :
+#       plus il est petit, mieux la paroi est isolee.
+#
+#   Les valeurs ci-dessous sont les ordres de grandeur usuels du bati
+#   francais (references DPE / 3CL et RT successives). Elles servent de
+#   point de depart : le correctif de calibration permet ensuite de recaler
+#   le modele sur une consommation reellement constatee.
+# --------------------------------------------------------------------------
+U_MURS = {
+    "Pierre, pise ou brique pleine, non isole (2,00)": 2.00,
+    "Parpaing ou beton, non isole (2,50)": 2.50,
+    "Brique creuse ou bloc ancien, non isole (1,60)": 1.60,
+    "Isolation legere 5 a 6 cm, annees 1975-1990 (0,70)": 0.70,
+    "Isolation 10 cm par l'interieur (0,40)": 0.40,
+    "Isolation 14 a 16 cm, RT2005 a RT2012 (0,27)": 0.27,
+    "Isolation 20 cm par l'exterieur, RE2020 (0,18)": 0.18,
+    "Ossature bois tres isolee ou passif (0,12)": 0.12,
+}
+
+U_TOITURE = {
+    "Combles ou rampants non isoles (2,50)": 2.50,
+    "Toiture terrasse non isolee (2,00)": 2.00,
+    "Isolation ancienne 10 cm tassee (0,35)": 0.35,
+    "Isolation 20 cm (0,20)": 0.20,
+    "Isolation 30 cm, RT2012 (0,14)": 0.14,
+    "Isolation 40 cm, RE2020 (0,10)": 0.10,
+    "Toiture terrasse isolee 16 cm (0,25)": 0.25,
+    "Passif, 40 cm et plus (0,08)": 0.08,
+}
+
+U_PLANCHER = {
+    "Dalle ou plancher non isole (2,00)": 2.00,
+    "Plancher bois sur vide sanitaire, non isole (1,10)": 1.10,
+    "Isolation 5 cm (0,55)": 0.55,
+    "Isolation 10 cm (0,30)": 0.30,
+    "Isolation 16 cm, RT2012 (0,20)": 0.20,
+    "Isolation 25 cm, RE2020 ou passif (0,13)": 0.13,
+}
+
+U_VITRAGES = {
+    "Simple vitrage (4,80)": 4.80,
+    "Double vitrage ancien, avant 2000 (3,00)": 3.00,
+    "Double vitrage a isolation renforcee, argon (1,60)": 1.60,
+    "Double vitrage recent, RT2012 (1,40)": 1.40,
+    "Triple vitrage (1,00)": 1.00,
+}
+
+#: Repartition supposee des surfaces vitrees par azimut (degres depuis le nord).
+#: Sert a calculer les apports solaires gratuits sur des plans verticaux.
+ORIENTATIONS_VITRAGES = {
+    "Majorite au sud": {180.0: 0.55, 90.0: 0.15, 270.0: 0.15, 0.0: 0.15},
+    "Equilibre sud, est et ouest": {180.0: 0.40, 90.0: 0.25, 270.0: 0.25, 0.0: 0.10},
+    "Majorite est et ouest": {180.0: 0.20, 90.0: 0.35, 270.0: 0.35, 0.0: 0.10},
+    "Majorite au nord": {180.0: 0.15, 90.0: 0.15, 270.0: 0.15, 0.0: 0.55},
+    "Repartition uniforme": {180.0: 0.25, 90.0: 0.25, 270.0: 0.25, 0.0: 0.25},
+}
+
+MODE_BESOIN_SAISI = "Besoin annuel saisi directement"
+MODE_BESOIN_ENVELOPPE = "Calcule depuis l'enveloppe du logement"
+
+#: Pre-reglages d'isolation par epoque de construction. Le bouton de l'onglet
+#: Consommation ecrit ces valeurs dans les champs correspondants ; tout reste
+#: modifiable ensuite paroi par paroi.
+NIVEAUX_ISOLATION = {
+    "Passoire : bati ancien jamais renove": {
+        "iso_murs": "Pierre, pise ou brique pleine, non isole (2,00)",
+        "iso_toiture": "Combles ou rampants non isoles (2,50)",
+        "iso_plancher": "Dalle ou plancher non isole (2,00)",
+        "iso_vitrages": "Simple vitrage (4,80)",
+        "ponts_thermiques_pct": 8.0, "renouv_air_vol_h": 0.90,
+        "rendement_echangeur": 0.0, "b_plancher": 0.60,
+    },
+    "Avant 1975, sans isolation": {
+        "iso_murs": "Parpaing ou beton, non isole (2,50)",
+        "iso_toiture": "Combles ou rampants non isoles (2,50)",
+        "iso_plancher": "Plancher bois sur vide sanitaire, non isole (1,10)",
+        "iso_vitrages": "Double vitrage ancien, avant 2000 (3,00)",
+        "ponts_thermiques_pct": 10.0, "renouv_air_vol_h": 0.80,
+        "rendement_echangeur": 0.0, "b_plancher": 0.80,
+    },
+    "1975-1990, isolation legere": {
+        "iso_murs": "Isolation legere 5 a 6 cm, annees 1975-1990 (0,70)",
+        "iso_toiture": "Isolation ancienne 10 cm tassee (0,35)",
+        "iso_plancher": "Isolation 5 cm (0,55)",
+        "iso_vitrages": "Double vitrage ancien, avant 2000 (3,00)",
+        "ponts_thermiques_pct": 20.0, "renouv_air_vol_h": 0.65,
+        "rendement_echangeur": 0.0, "b_plancher": 0.80,
+    },
+    "1990-2005, isolation moyenne": {
+        "iso_murs": "Isolation 10 cm par l'interieur (0,40)",
+        "iso_toiture": "Isolation 20 cm (0,20)",
+        "iso_plancher": "Isolation 10 cm (0,30)",
+        "iso_vitrages": "Double vitrage a isolation renforcee, argon (1,60)",
+        "ponts_thermiques_pct": 20.0, "renouv_air_vol_h": 0.55,
+        "rendement_echangeur": 0.0, "b_plancher": 0.80,
+    },
+    "RT2012, construction 2013-2021": {
+        "iso_murs": "Isolation 14 a 16 cm, RT2005 a RT2012 (0,27)",
+        "iso_toiture": "Isolation 30 cm, RT2012 (0,14)",
+        "iso_plancher": "Isolation 16 cm, RT2012 (0,20)",
+        "iso_vitrages": "Double vitrage recent, RT2012 (1,40)",
+        "ponts_thermiques_pct": 15.0, "renouv_air_vol_h": 0.45,
+        "rendement_echangeur": 0.0, "b_plancher": 0.70,
+    },
+    "RE2020 ou renovation performante": {
+        "iso_murs": "Isolation 20 cm par l'exterieur, RE2020 (0,18)",
+        "iso_toiture": "Isolation 40 cm, RE2020 (0,10)",
+        "iso_plancher": "Isolation 25 cm, RE2020 ou passif (0,13)",
+        "iso_vitrages": "Triple vitrage (1,00)",
+        "ponts_thermiques_pct": 8.0, "renouv_air_vol_h": 0.40,
+        "rendement_echangeur": 0.75, "b_plancher": 0.70,
+    },
+    "Passif": {
+        "iso_murs": "Ossature bois tres isolee ou passif (0,12)",
+        "iso_toiture": "Passif, 40 cm et plus (0,08)",
+        "iso_plancher": "Isolation 25 cm, RE2020 ou passif (0,13)",
+        "iso_vitrages": "Triple vitrage (1,00)",
+        "ponts_thermiques_pct": 5.0, "renouv_air_vol_h": 0.35,
+        "rendement_echangeur": 0.85, "b_plancher": 0.70,
+    },
+}
+
+
+def u_valeur(table: dict, cle, defaut: float) -> float:
+    """U d'une paroi a partir du libelle choisi, tolerant aux libelles inconnus.
+
+    Une configuration enregistree avec une version anterieure peut contenir un
+    libelle qui n'existe plus : mieux vaut retomber sur la valeur par defaut
+    que faire disparaitre la paroi du calcul.
+    """
+    if cle in table:
+        return float(table[cle])
+    return float(defaut)
+
+
+#: Infobulles des listes deroulantes qui ne sont pas des profils horaires.
+#: SchemaForm les affiche au survol de chaque entree de la liste.
+CHOIX_AIDE = {
+    MODE_BESOIN_SAISI:
+        "Vous entrez vous-meme le nombre de kWh thermiques annuels, en bas de "
+        "ce groupe. La description de l'enveloppe est alors ignoree.",
+    MODE_BESOIN_ENVELOPPE:
+        "Le besoin est calcule heure par heure a partir des deperditions du "
+        "logement, de la temperature reelle de la serie meteo et des apports "
+        "gratuits (occupants, appareils, soleil a travers les vitrages). "
+        "C'est le mode a utiliser quand on ne connait pas sa consommation, "
+        "ou pour chiffrer l'effet de travaux d'isolation.",
+}
+CHOIX_AIDE.update({
+    cle: (f"U = {u:.2f} W/m2/K : {u * 100:.0f} watts perdus par degre d'ecart "
+          f"pour 100 m2 de cette paroi.")
+    for table in (U_MURS, U_TOITURE, U_PLANCHER, U_VITRAGES)
+    for cle, u in table.items()
+})
+_POINTS_CARDINAUX = {180.0: "sud", 90.0: "est", 270.0: "ouest", 0.0: "nord"}
+CHOIX_AIDE.update({
+    cle: ("Parts supposees des surfaces vitrees : "
+          + ", ".join(f"{part * 100:.0f} % {_POINTS_CARDINAUX[az]}"
+                      for az, part in parts.items()))
+    for cle, parts in ORIENTATIONS_VITRAGES.items()
+})
+
+
+# --------------------------------------------------------------------------
 # Schemas des postes de consommation
 #   (cle, libelle, type, min, max, pas/choix, aide)
 # --------------------------------------------------------------------------
@@ -147,7 +328,7 @@ LOAD_KINDS = {
         "label": "Talon permanent",
         "help": "Puissance appelee 24h/24 : veilles, froid, VMC, box, hors-gel, circulateurs.",
         "params": [
-            ("puissance_w", "Puissance permanente (W)", "float", 0, 5000, 10,
+            ("puissance_w", "Puissance permanente (W)", "float", 0, 2000000, 10,
              "<b>Watts appeles en continu, 24 h/24.</b><br>"
              "Somme des appareils qui ne s'arretent jamais : refrigerateur et "
              "congelateur, VMC, box internet, alarme, circulateurs, veilles.<br>"
@@ -165,7 +346,7 @@ LOAD_KINDS = {
         "label": "Poste generique (kWh/an)",
         "help": "Tout usage decrit par une consommation annuelle, un profil horaire et des poids mensuels.",
         "params": [
-            ("kwh_an", "Consommation annuelle (kWh/an)", "float", 0, 50000, 50,
+            ("kwh_an", "Consommation annuelle (kWh/an)", "float", 0, 20000000, 50,
              "<b>Energie electrique consommee sur une annee, en kWh.</b><br>"
              "C'est le chiffre lu sur une facture ou sur une prise mesureuse.<br>"
              "Reperes : cuisson induction 700 a 1 200 kWh/an, "
@@ -182,25 +363,250 @@ LOAD_KINDS = {
         "label": "Chauffage (PAC air/air)",
         "help": ("Besoin thermique reparti sur les degres-heures reels de la meteo, "
                  "converti en electricite par un COP dependant de la temperature exterieure. "
-                 "Au-dela de la puissance de la PAC, l'appoint electrique direct prend le relais."),
+                 "Au-dela de la puissance de la PAC, l'appoint electrique direct prend le relais.<br>"
+                 "Le besoin peut etre saisi directement si vous le connaissez, ou "
+                 "calcule a partir de la description du logement (surface, hauteur "
+                 "sous plafond, isolation de chaque paroi, vitrages, ventilation)."),
         "params": [
-            ("besoin_th_kwh_an", "Besoin thermique (kWh th/an)", "float",
-             0, 80000, 100,
+            ("mode_besoin", "Origine du besoin de chauffage", "choice", None, None,
+             [MODE_BESOIN_SAISI, MODE_BESOIN_ENVELOPPE],
+             "<b>Deux facons d'obtenir le besoin de chaleur du logement.</b><br>"
+             "&bull; <b>Saisi</b> : vous connaissez le chiffre (facture de gaz, "
+             "releve d'un ancien systeme, etude thermique). Les deux champs "
+             "suivants suffisent, tout le reste des groupes <i>Enveloppe</i> est "
+             "ignore.<br>"
+             "&bull; <b>Calcule depuis l'enveloppe</b> : le besoin est reconstruit "
+             "heure par heure a partir des deperditions de la maison "
+             "(surface x U de chaque paroi + ventilation + ponts thermiques), de "
+             "la temperature reelle de la serie meteo et des apports gratuits. "
+             "Les champs <i>Besoin thermique si saisi</i> et <i>Temp. de "
+             "non-chauffage</i> ne servent alors plus : les deux sont des "
+             "resultats du calcul, affiches dans le panneau de synthese."),
+            ("besoin_th_kwh_an", "Besoin thermique si saisi (kWh th/an)", "float",
+             0, 2000000, 100,
              "<b>Chaleur a fournir au logement sur une annee, en kWh thermiques.</b><br>"
+             "<i>Utilise uniquement en mode \"besoin saisi\".</i><br>"
              "Ce n'est PAS la consommation electrique : la PAC divise ce chiffre "
              "par son COP (~3), donc 28 000 kWh thermiques coutent environ "
              "9 000 kWh electriques.<br>"
              "Reperes : maison de 150 m2 non renovee 20 000 a 30 000 kWh th/an, "
              "bien isolee 8 000 a 15 000 kWh th/an, RT2012 5 000 a 8 000."),
-            ("t_base", "Temp. de non-chauffage (C)", "float", 10, 22, .5,
+            ("t_base", "Temp. de non-chauffage si saisi (C)", "float", 5, 22, .5,
              "<b>Temperature exterieure au-dessus de laquelle on ne chauffe plus.</b><br>"
-             "Les apports gratuits (soleil, occupants, appareils) suffisent.<br>"
+             "<i>Utilise uniquement en mode \"besoin saisi\".</i> En mode calcule, "
+             "elle se deduit du rapport entre les apports gratuits et les "
+             "deperditions, et le resultat est affiche dans la synthese.<br>"
+             "Les apports gratuits (soleil, occupants, appareils) suffisent "
+             "au-dessus de ce seuil.<br>"
              "17 C pour une maison ordinaire, 15 C bien isolee, 19 C passoire."),
-            ("t_consigne", "Temp. interieure visee (C)", "float", 15, 25, .5,
+            ("t_consigne", "Temp. interieure visee (C)", "float", 12, 28, .5,
              "<b>Consigne moyenne du thermostat, en degres C.</b><br>"
              "Moyenne sur la journee et sur toutes les pieces, reduits de nuit "
-             "compris. 1 C de moins, c'est environ 7 % de chauffage en moins."),
-            ("cop_a", "COP : ordonnee a l'origine", "float", 0.5, 5, .05,
+             "compris. 1 C de moins, c'est environ 7 % de chauffage en moins.<br>"
+             "Agit dans les deux modes."),
+            ("inertie_h", "Lissage d'inertie (heures)", "float", 0, 48, 1,
+             "<b>Moyenne glissante appliquee a la temperature exterieure et aux "
+             "apports solaires, en heures.</b><br>"
+             "Represente l'inertie thermique du batiment : une maison lourde ne "
+             "suit pas la temperature exterieure instantanee, et elle restitue "
+             "le soleil de l'apres-midi en debut de soiree.<br>"
+             "6 h pour du parpaing ou de la pierre, 2 h pour de l'ossature bois, "
+             "24 h pour une maison tres lourde en pierre epaisse, 0 pour "
+             "desactiver."),
+
+            ("__grp_geo", "Enveloppe : geometrie du logement (mode calcule)",
+             None, None, None, None, ""),
+            ("surface_habitable_m2", "Surface habitable chauffee (m2)", "float",
+             0, 20000, 5,
+             "<b>Somme des surfaces chauffees, tous niveaux confondus, en m2.</b><br>"
+             "Ne comptez pas le garage, la cave ni les combles perdus s'ils ne "
+             "sont pas chauffes : ils sont traites comme de l'exterieur "
+             "attenue par le coefficient d'exposition du plancher bas.<br>"
+             "C'est la grandeur qui pilote tout le calcul : surface des parois, "
+             "volume d'air a renouveler, apports internes."),
+            ("n_niveaux", "Nombre de niveaux chauffes", "int", 1, 40, 1,
+             "<b>Combien d'etages chauffes sont empiles.</b><br>"
+             "Deux niveaux de 100 m2 perdent beaucoup moins qu'un plain-pied de "
+             "200 m2 : la toiture et le plancher bas sont deux fois plus petits, "
+             "seuls les murs augmentent. C'est l'effet de compacite.<br>"
+             "Un plain-pied vaut 1 ; comptez les combles amenages chauffes comme "
+             "un niveau."),
+            ("hauteur_sous_plafond_m", "Hauteur sous plafond (m)", "float",
+             1.8, 12, .05,
+             "<b>Hauteur libre d'un niveau, du sol au plafond, en metres.</b><br>"
+             "Elle agit deux fois : sur la surface des murs exterieurs "
+             "(perimetre x hauteur) et sur le volume d'air a rechauffer a chaque "
+             "renouvellement.<br>"
+             "2,50 m en construction courante, 2,20 m dans l'ancien modeste, "
+             "3,00 a 4,00 m dans une maison de maitre, une grange ou un loft : "
+             "c'est la que la facture se creuse."),
+            ("allongement", "Allongement au sol (longueur / largeur)", "float",
+             1, 12, .1,
+             "<b>Rapport entre la longueur et la largeur de l'emprise au sol.</b><br>"
+             "Sert a estimer le perimetre, donc la surface de murs exterieurs, "
+             "a partir de la seule surface au sol.<br>"
+             "&bull; 1,0 : carre, la forme la plus compacte possible<br>"
+             "&bull; 1,5 : maison courante (par defaut)<br>"
+             "&bull; 3,0 et plus : longere, batiment en L ou tres decoupe<br>"
+             "<i>A surface egale, passer de 1,0 a 3,0 ajoute environ 15 % de "
+             "murs exterieurs.</i>"),
+            ("part_murs_mitoyens", "Part de murs mitoyens (0 a 1)", "float",
+             0, 0.9, .05,
+             "<b>Fraction des murs qui donne sur un logement voisin chauffe.</b><br>"
+             "Ces murs ne perdent rien : de l'autre cote il fait la meme "
+             "temperature.<br>"
+             "0 = maison isolee sur les quatre faces, 0,25 = maison en bande de "
+             "bout, 0,5 = appartement ou maison de ville prise entre deux voisins."),
+
+            ("__grp_iso", "Enveloppe : isolation des parois (mode calcule)",
+             None, None, None, None, ""),
+            ("iso_murs", "Murs exterieurs", "choice", None, None, list(U_MURS),
+             "<b>Niveau d'isolation des murs donnant sur l'exterieur.</b><br>"
+             "Le chiffre entre parentheses est le coefficient U en W/m2/K : "
+             "watts perdus par metre carre de mur et par degre d'ecart entre "
+             "l'interieur et l'exterieur. Plus il est bas, mieux c'est.<br>"
+             "Les murs sont en general le premier poste de deperdition apres "
+             "la toiture : ils representent la plus grande surface."),
+            ("iso_toiture", "Toiture ou plafond haut", "choice", None, None,
+             list(U_TOITURE),
+             "<b>Niveau d'isolation entre le dernier niveau chauffe et le dehors "
+             "(combles, rampants, toiture terrasse).</b><br>"
+             "C'est la paroi ou l'isolation rapporte le plus : la chaleur monte, "
+             "et des combles non isoles peuvent representer 25 a 30 % des "
+             "deperditions a eux seuls.<br>"
+             "Si les combles sont perdus mais fermes, choisissez le niveau "
+             "correspondant au plafond, pas a la couverture."),
+            ("iso_plancher", "Plancher bas", "choice", None, None, list(U_PLANCHER),
+             "<b>Niveau d'isolation du plancher du niveau le plus bas.</b><br>"
+             "Le coefficient d'exposition ci-dessous corrige ensuite selon ce "
+             "qu'il y a dessous : la terre est bien plus clemente que l'air "
+             "exterieur."),
+            ("b_plancher", "Exposition du plancher bas (0 a 1)", "float",
+             0.1, 1, .05,
+             "<b>Attenuation appliquee aux pertes du plancher bas.</b><br>"
+             "Un plancher ne donne presque jamais sur l'air exterieur : ce qu'il "
+             "y a dessous est deja partiellement rechauffe.<br>"
+             "&bull; 0,50 : dalle sur terre-plein, la terre est a 10-12 C<br>"
+             "&bull; 0,60 : cave ou garage non chauffe mais ferme<br>"
+             "&bull; 0,80 : vide sanitaire ventile (par defaut)<br>"
+             "&bull; 1,00 : plancher sur porche, passage ouvert ou pilotis<br>"
+             "&bull; 0,10 : etage superieur d'un immeuble, voisin chauffe dessous"),
+            ("iso_vitrages", "Fenetres et portes-fenetres", "choice", None, None,
+             list(U_VITRAGES),
+             "<b>Type de vitrage des menuiseries, portes comprises.</b><br>"
+             "Un simple vitrage perd trois fois plus qu'un double a isolation "
+             "renforcee, et quatre fois plus qu'un triple.<br>"
+             "Les vitrages sont aussi ce qui laisse entrer le soleil : le calcul "
+             "leur compte a la fois les pertes et les apports gratuits."),
+            ("part_vitree_pct", "Surface vitree (% de la surface habitable)",
+             "float", 0, 80, .5,
+             "<b>Surface totale des fenetres rapportee a la surface habitable.</b><br>"
+             "&bull; 10 % : bati ancien, petites ouvertures<br>"
+             "&bull; 16 % : construction courante, minimum reglementaire (1/6)<br>"
+             "&bull; 25 a 35 % : maison contemporaine tres vitree, veranda<br>"
+             "<i>Plus de vitrage, c'est plus de pertes la nuit et plus d'apports "
+             "solaires le jour : l'arbitrage depend de l'orientation, saisie "
+             "dans le groupe des apports gratuits.</i>"),
+            ("ponts_thermiques_pct", "Ponts thermiques (% des parois)", "float",
+             0, 60, 1,
+             "<b>Supplement de deperdition aux jonctions entre parois, en "
+             "pourcent des pertes par les parois.</b><br>"
+             "Un pont thermique est un endroit ou l'isolant est interrompu : "
+             "about de plancher, refend, linteau, appui de fenetre, balcon.<br>"
+             "&bull; 5 a 10 % : maison non isolee (les murs perdent deja tant "
+             "que les jonctions ne se voient pas) ou isolation par l'exterieur "
+             "bien faite<br>"
+             "&bull; 15 a 25 % : isolation par l'interieur, cas le plus "
+             "frequent<br>"
+             "&bull; 5 % : ossature bois ou maison passive"),
+
+            ("__grp_air", "Enveloppe : renouvellement d'air (mode calcule)",
+             None, None, None, None, ""),
+            ("renouv_air_vol_h", "Renouvellement d'air (volumes/heure)", "float",
+             0, 5, .05,
+             "<b>Combien de fois par heure tout l'air du logement est remplace "
+             "par de l'air exterieur a rechauffer.</b><br>"
+             "Ventilation reglementaire ET fuites d'air confondues.<br>"
+             "&bull; 0,90 : bati ancien tres permeable, ventilation par les "
+             "defauts d'etancheite<br>"
+             "&bull; 0,65 : VMC simple flux autoreglable sur bati moyen<br>"
+             "&bull; 0,45 : VMC hygroreglable, construction recente<br>"
+             "&bull; 0,35 : maison tres etanche a l'air<br>"
+             "<i>Chaque volume horaire coute 0,34 Wh par m3 et par degre "
+             "d'ecart : sur 400 m3 et 15 degres d'ecart, 0,65 vol/h = 1,3 kW "
+             "en continu.</i>"),
+            ("rendement_echangeur", "Rendement de l'echangeur double flux (0 a 1)",
+             "float", 0, 0.95, .05,
+             "<b>Part de la chaleur de l'air extrait recuperee sur l'air "
+             "entrant.</b><br>"
+             "&bull; 0 : ventilation naturelle ou VMC simple flux, aucune "
+             "recuperation (par defaut)<br>"
+             "&bull; 0,75 a 0,85 : VMC double flux avec echangeur<br>"
+             "Reduit d'autant le cout du renouvellement d'air, sans changer le "
+             "debit."),
+
+            ("__grp_gains", "Enveloppe : apports gratuits (mode calcule)",
+             None, None, None, None, ""),
+            ("apports_internes_w_m2", "Apports internes (W/m2 habitable)", "float",
+             0, 30, .5,
+             "<b>Chaleur degagee gratuitement a l'interieur, en watts par m2.</b><br>"
+             "Occupants (environ 80 W chacun), cuisson, eclairage, "
+             "electromenager, eau chaude qui refroidit dans les tuyaux : tout "
+             "cela chauffe la maison et vient en deduction du besoin.<br>"
+             "&bull; 3,0 a 4,0 W/m2 : valeur courante (par defaut 3,5)<br>"
+             "&bull; 5,0 et plus : logement petit et tres occupe, teletravail<br>"
+             "&bull; 2,0 : grande maison peu occupee<br>"
+             "<i>Sur 200 m2, 3,5 W/m2 = 700 W en permanence, soit environ "
+             "6 100 kWh de chaleur gratuite par an.</i>"),
+            ("orientation_vitrages", "Orientation dominante des vitrages", "choice",
+             None, None, list(ORIENTATIONS_VITRAGES),
+             "<b>Ou regardent les fenetres.</b><br>"
+             "Le rayonnement recu par un vitrage vertical est calcule pour "
+             "chaque orientation a partir de la serie meteo reelle, puis "
+             "pondere selon la repartition choisie ici.<br>"
+             "En hiver, le soleil est bas : un vitrage vertical au sud recoit "
+             "plus d'energie qu'un panneau a plat. Une maison bien orientee "
+             "peut couvrir 10 a 20 % de son besoin de chauffage par le seul "
+             "soleil qui traverse les fenetres."),
+            ("g_vitrage", "Facteur solaire du vitrage g (0 a 1)", "float",
+             0, 0.95, .05,
+             "<b>Part du rayonnement solaire qui traverse le vitrage, avant "
+             "masques.</b><br>"
+             "&bull; 0,85 : simple vitrage clair<br>"
+             "&bull; 0,75 : double vitrage classique<br>"
+             "&bull; 0,55 : double vitrage a isolation renforcee (par defaut) : "
+             "la couche peu emissive qui retient la chaleur arrete aussi une "
+             "partie du soleil<br>"
+             "&bull; 0,50 : triple vitrage<br>"
+             "&bull; 0,35 : vitrage a controle solaire"),
+            ("facteur_masques_solaires",
+             "Transmission reelle (cadres, masques, rideaux)", "float",
+             0.05, 1, .05,
+             "<b>Ce qui reste des apports solaires apres tout ce qui les "
+             "ampute.</b><br>"
+             "Produit de trois effets : la menuiserie occupe 25 a 30 % du "
+             "tableau, les masques exterieurs (avant-toit, arbres, maison "
+             "voisine, relief) coupent une partie du ciel, et les rideaux ou "
+             "volets fermes en fin de journee arretent le reste.<br>"
+             "&bull; 0,45 : cas courant (par defaut)<br>"
+             "&bull; 0,60 : grandes baies degagees, peu d'encadrement<br>"
+             "&bull; 0,25 : petites fenetres, avant-toit marque, masques "
+             "proches"),
+            ("correctif_deperditions", "Correctif de calage (1,00 = modele brut)",
+             "float", 0.2, 5, .05,
+             "<b>Multiplicateur applique a toutes les deperditions, pour recaler "
+             "le modele sur une consommation reellement constatee.</b><br>"
+             "Le calcul par l'enveloppe est une estimation : il ignore la "
+             "qualite de mise en oeuvre, l'etat des menuiseries, les pieces "
+             "peu chauffees, les habitudes d'aeration.<br>"
+             "Methode : laissez 1,00, comparez le besoin calcule affiche dans "
+             "la synthese a ce que vous consommez vraiment, puis ajustez. "
+             "1,20 = le modele sous-estimait de 20 %.<br>"
+             "<i>Tant que vous n'avez pas de consommation reelle a comparer, "
+             "laissez 1,00.</i>"),
+
+            ("__grp_pac", "Pompe a chaleur", None, None, None, None, ""),
+            ("cop_a", "COP : ordonnee a l'origine", "float", 0.5, 8, .05,
              "<b>Le COP est modelise par COP = a + b x (temperature exterieure).</b><br>"
              "<i>a</i> est le COP theorique a 0 C exterieur. 2,75 pour une PAC "
              "air/air recente ; 2,2 pour un modele ancien.<br>"
@@ -209,49 +615,62 @@ LOAD_KINDS = {
              "<b>Gain de COP par degre exterieur supplementaire.</b><br>"
              "Dans COP = a + b x Text. Typiquement 0,09 : il fait plus froid "
              "dehors, la PAC doit pomper plus haut, son rendement chute."),
-            ("cop_max", "COP plafond", "float", 2, 7, .1,
+            ("cop_max", "COP plafond", "float", 2, 10, .1,
              "<b>Plafond applique au COP par temps doux.</b><br>"
              "La formule lineaire diverge quand il fait chaud ; on la bride ici. "
              "4,6 est realiste pour une PAC air/air moderne."),
             ("p_pac_kw_th", "Puissance PAC (kW th a 7 C)", "float",
-             0, 60, .5,
+             0, 5000, .5,
              "<b>Chaleur maximale que la PAC peut delivrer, en kW, mesuree a "
              "+7 C exterieur (point de reference normalise).</b><br>"
              "Au-dela de ce plafond, l'appoint electrique direct (COP 1) prend "
              "le relais et fait exploser la consommation.<br>"
-             "Repere : 1 kW thermique pour 12 a 20 m2 selon l'isolation."),
-            ("declassement_froid", "Declassement a -7 C (0 a 1)", "float", 0, .6, .01,
+             "Repere : 1 kW thermique pour 12 a 20 m2 selon l'isolation. En "
+             "mode calcule, la synthese affiche la puissance de dimensionnement "
+             "deduite de l'enveloppe et de l'hiver le plus froid de la serie."),
+            ("declassement_froid", "Declassement a -7 C (0 a 1)", "float", 0, .8, .01,
              "<b>Part de puissance perdue quand il fait -7 C plutot que +7 C.</b><br>"
              "0,28 = la PAC ne delivre plus que 72 % de sa puissance nominale. "
              "Le declassement est interpole lineairement entre les deux points.<br>"
              "0,20 a 0,30 pour une PAC air/air, moins pour un modele grand froid."),
+
+            ("__grp_bois", "Appoint bois", None, None, None, None, ""),
             ("part_bois", "Part couverte par le bois (0 a 1)", "float", 0, 1, .05,
              "<b>Fraction du besoin de chauffage reprise par un insert ou un poele, "
              "uniquement en dessous du seuil d'allumage ci-dessous.</b><br>"
              "0,35 = un tiers du besoin des jours froids part sur le bois, donc "
              "en moins sur l'electricite. 0 = pas de bois."),
-            ("t_bois", "Seuil d'allumage du bois (C)", "float", -10, 15, .5,
+            ("t_bois", "Seuil d'allumage du bois (C)", "float", -20, 18, .5,
              "<b>En dessous de cette temperature exterieure, le poele est allume.</b><br>"
              "5 C : on allume les vraies journees froides. "
              "12 C : on allume des les mi-saisons."),
-            ("inertie_h", "Lissage d'inertie (heures)", "float", 0, 12, 1,
-             "<b>Moyenne glissante appliquee a la temperature exterieure, en heures.</b><br>"
-             "Represente l'inertie thermique du batiment : une maison lourde ne "
-             "suit pas la temperature exterieure instantanee.<br>"
-             "6 h pour du parpaing ou de la pierre, 2 h pour de l'ossature bois, "
-             "0 pour desactiver."),
         ],
-        "defaults": {"besoin_th_kwh_an": 28240, "t_base": 17.0, "t_consigne": 19.5,
+        "defaults": {"mode_besoin": MODE_BESOIN_SAISI,
+                     "besoin_th_kwh_an": 28240, "t_base": 17.0, "t_consigne": 19.5,
+                     "inertie_h": 6,
+                     "surface_habitable_m2": 200.0, "n_niveaux": 2,
+                     "hauteur_sous_plafond_m": 2.5, "allongement": 1.5,
+                     "part_murs_mitoyens": 0.0,
+                     "iso_murs": "Isolation legere 5 a 6 cm, annees 1975-1990 (0,70)",
+                     "iso_toiture": "Isolation ancienne 10 cm tassee (0,35)",
+                     "iso_plancher": "Isolation 5 cm (0,55)",
+                     "b_plancher": 0.80,
+                     "iso_vitrages": "Double vitrage ancien, avant 2000 (3,00)",
+                     "part_vitree_pct": 16.0, "ponts_thermiques_pct": 20.0,
+                     "renouv_air_vol_h": 0.65, "rendement_echangeur": 0.0,
+                     "apports_internes_w_m2": 3.5,
+                     "orientation_vitrages": "Equilibre sud, est et ouest",
+                     "g_vitrage": 0.55, "facteur_masques_solaires": 0.45,
+                     "correctif_deperditions": 1.0,
                      "cop_a": 2.75, "cop_b": 0.093, "cop_max": 4.6, "p_pac_kw_th": 26.0,
-                     "declassement_froid": 0.28, "part_bois": 0.35, "t_bois": 5.0,
-                     "inertie_h": 6},
+                     "declassement_froid": 0.28, "part_bois": 0.35, "t_bois": 5.0},
     },
     "ecs": {
         "label": "Eau chaude sanitaire",
         "help": "Ballon a resistance (COP 1) ou chauffe-eau thermodynamique (COP 2,5 a 3,2).",
         "params": [
             ("besoin_th_kwh_an", "Besoin thermique annuel (kWh thermiques/an)", "float",
-             0, 20000, 50,
+             0, 2000000, 50,
              "<b>Chaleur necessaire pour chauffer l'eau sanitaire sur une annee.</b><br>"
              "Pas la consommation electrique : elle sera divisee par le COP.<br>"
              "Repere : environ 800 kWh thermiques par personne et par an "
@@ -279,7 +698,7 @@ LOAD_KINDS = {
         "label": "Piscine (filtration)",
         "help": "Pompe de filtration, duree journaliere reglable mois par mois.",
         "params": [
-            ("p_pompe_w", "Puissance de la pompe (W)", "float", 0, 5000, 25,
+            ("p_pompe_w", "Puissance de la pompe (W)", "float", 0, 500000, 25,
              "<b>Puissance electrique absorbee par la pompe de filtration, en watts.</b><br>"
              "Lue sur la plaque signaletique. 550 a 1 100 W pour une pompe "
              "classique, 150 a 400 W pour une pompe a vitesse variable en "
@@ -293,7 +712,7 @@ LOAD_KINDS = {
             ("profil", "Profil journalier (repartition sur 24 h)", "choice", None, None,
              list(DAILY_SHAPES), AIDE_PROFIL),
             ("pac_piscine_kwh_an", "PAC piscine (kWh elec/an)", "float",
-             0, 20000, 50,
+             0, 2000000, 50,
              "<b>Consommation electrique annuelle du rechauffeur, en kWh.</b><br>"
              "0 si la piscine n'est pas chauffee.<br>"
              "Repere : 2 000 a 5 000 kWh/an pour une PAC de piscine sur un "
@@ -309,7 +728,7 @@ LOAD_KINDS = {
                  "et la temperature exterieure reelle, plus la consommation des pompes."),
         "params": [
             ("ua_w_par_k", "Pertes UA (W/C d'ecart)", "float",
-             0, 80, .5,
+             0, 20000, .5,
              "<b>Watts perdus par degre d'ecart entre l'eau et l'air exterieur.</b><br>"
              "C'est la qualite de l'isolation de la cuve et de la couverture.<br>"
              "&bull; 10 a 14 W/K : spa rigide bien isole, couverture en place<br>"
@@ -324,7 +743,7 @@ LOAD_KINDS = {
              "<b>Rendement du systeme de chauffe.</b><br>"
              "&bull; 1,0 = resistance electrique (cas de la quasi-totalite des spas)<br>"
              "&bull; 4 a 5 = pompe a chaleur de spa, en option sur les modeles haut de gamme"),
-            ("pompes_kwh_an", "Pompes et jets (kWh/an)", "float", 0, 3000, 25,
+            ("pompes_kwh_an", "Pompes et jets (kWh/an)", "float", 0, 500000, 25,
              "<b>Consommation electrique annuelle des pompes de filtration et de "
              "massage, hors chauffage.</b><br>"
              "200 a 500 kWh/an selon la frequence d'utilisation."),
@@ -340,10 +759,10 @@ LOAD_KINDS = {
         "label": "Vehicule electrique",
         "help": "Recharge, pilotable en heures solaires ou nocturnes.",
         "params": [
-            ("km_an", "Kilometrage annuel (km/an)", "float", 0, 60000, 500,
+            ("km_an", "Kilometrage annuel (km/an)", "float", 0, 2000000, 500,
              "<b>Distance parcourue en une annee, en kilometres.</b><br>"
              "Moyenne francaise : environ 12 000 km/an."),
-            ("conso_kwh_100km", "Consommation (kWh/100 km)", "float", 8, 35, .5,
+            ("conso_kwh_100km", "Consommation (kWh/100 km)", "float", 5, 300, .5,
              "<b>Energie consommee aux 100 km, pertes de charge comprises.</b><br>"
              "Comptez la valeur affichee au tableau de bord plus 10 a 15 % de "
              "pertes dans le chargeur.<br>"
@@ -370,17 +789,17 @@ LOAD_KINDS = {
 # --------------------------------------------------------------------------
 SYSTEM_SCHEMA = [
     ("__grp", "Onduleurs hybrides", None, None, None, None, ""),
-    ("n_onduleurs", "Nombre d'onduleurs (u)", "int", 1, 12, 1,
+    ("n_onduleurs", "Nombre d'onduleurs (u)", "int", 1, 2000, 1,
      "<b>Combien d'onduleurs hybrides sont installes en parallele.</b><br>"
      "Un onduleur hybride gere a la fois les panneaux, la batterie et le "
      "reseau. Leurs puissances et leurs limites PV s'additionnent."),
-    ("p_nom_kw", "Puissance AC unitaire (kW)", "float", 1, 50, .5,
+    ("p_nom_kw", "Puissance AC unitaire (kW)", "float", 0.1, 5000, .5,
      "<b>Puissance de sortie continue d'UN onduleur, en kW.</b><br>"
      "C'est le debit maximal vers la maison. Toute production qui depasse "
      "n_onduleurs x cette valeur est ecretee (perdue).<br>"
      "Exemple : Deye SUN-12K = 12 kW."),
     ("pv_max_kwc_par_onduleur", "PV admissible unitaire (kWc)", "float",
-     1, 40, .1,
+     0.1, 8000, .1,
      "<b>Puissance crete de panneaux que le constructeur autorise sur UN onduleur.</b><br>"
      "Toujours superieure a la puissance AC (surdimensionnement volontaire : "
      "les panneaux atteignent rarement leur crete). Ratio courant 1,2 a 1,5.<br>"
@@ -396,17 +815,17 @@ SYSTEM_SCHEMA = [
      "<b>Rendement de la restitution batterie -> maison.</b><br>"
      "Combine avec le rendement de decharge, il donne le cout reel d'un "
      "stockage : environ 10 % de l'energie stockee est perdue a l'aller-retour."),
-    ("veille_w", "Conso a vide, jour (W/onduleur)", "float", 0, 300, 1,
+    ("veille_w", "Conso a vide, jour (W/onduleur)", "float", 0, 20000, 1,
      "<b>Watts absorbes en permanence par UN onduleur pour fonctionner, "
      "quand il produit.</b><br>"
      "55 W x 2 onduleurs x 24 h = 964 kWh/an consommes juste pour exister. "
      "Ce poste est souvent sous-estime dans les devis."),
-    ("veille_nuit_w", "Conso a vide, nuit (W/onduleur)", "float", 0, 300, 1,
+    ("veille_nuit_w", "Conso a vide, nuit (W/onduleur)", "float", 0, 20000, 1,
      "<b>Watts absorbes par onduleur la nuit, en veille profonde.</b><br>"
      "Inferieur a la valeur de jour car les etages de puissance PV sont "
      "au repos."),
     ("__grp_dc", "Limites d'entree continue (DC) des onduleurs", None, None, None, None, ""),
-    ("vdc_max_v", "Tension DC maximale (V)", "float", 100, 1500, 10,
+    ("vdc_max_v", "Tension DC maximale (V)", "float", 50, 2000, 10,
      "<b>Tension continue maximale que l'entree PV de l'onduleur supporte, en volts.</b><br>"
      "A ne JAMAIS depasser, meme une seconde : c'est une destruction immediate "
      "et hors garantie.<br>"
@@ -414,29 +833,49 @@ SYSTEM_SCHEMA = [
      "vide : la tension Voc monte quand il fait froid. L'onglet Champs PV "
      "calcule cette tension a froid pour chaque grappe.<br>"
      "Repere : 500 V sur les petits hybrides, 800 a 1 000 V sur les Deye triphases."),
-    ("vmppt_min_v", "Tension MPPT minimale (V)", "float", 50, 800, 5,
+    ("vmppt_min_v", "Tension MPPT minimale (V)", "float", 10, 1500, 5,
      "<b>Tension en dessous de laquelle le suiveur MPPT ne demarre plus.</b><br>"
      "Une grappe trop courte ne produira rien le matin, le soir et par temps "
      "couvert. La tension de travail (Vmp) chute aussi quand les panneaux "
      "chauffent : gardez de la marge.<br>"
      "Repere : 125 a 200 V sur les Deye."),
-    ("i_max_string_a", "Courant max par MPPT (A)", "float", 5, 60, .5,
+    ("i_max_string_a", "Courant max par MPPT (A)", "float", 1, 1000, .5,
      "<b>Courant continu maximal accepte sur une entree MPPT, en amperes.</b><br>"
      "Une grappe qui depasse cette valeur sera bridee : la production est "
      "perdue. Comparez-la au courant Isc calcule dans l'onglet Champs PV.<br>"
      "Repere : 13 a 26 A selon les modeles."),
-    ("n_mppt_par_onduleur", "Entrees MPPT par onduleur", "int", 1, 8, 1,
+    ("n_mppt_par_onduleur", "Entrees MPPT par onduleur", "int", 1, 64, 1,
      "<b>Nombre de suiveurs de point de puissance maximale (MPPT) sur UN onduleur.</b><br>"
      "Chaque MPPT pilote independamment une ou deux grappes : c'est ce qui "
      "permet de melanger des orientations differentes sans que la moins bonne "
      "penalise l'autre.<br>"
      "Regle : une orientation ou une inclinaison differente = un MPPT different."),
     ("__grp2", "Batterie LFP", None, None, None, None, ""),
-    ("batt_kwh_nominal", "Capacite nominale (kWh)", "float", 0, 400, 1,
+    ("batt_kwh_nominal", "Capacite nominale (kWh)", "float", 0, 500000, 1,
      "<b>Capacite totale marquee sur la batterie, en kWh.</b><br>"
      "L'energie reellement exploitable est plus faible : voir la profondeur "
      "de decharge juste en dessous. Le resultat utile est affiche a droite "
      "apres simulation."),
+    ("cell_ah", "Capacite d'une cellule (Ah)", "float", 1, 2000, 1,
+     "<b>Capacite d'UNE cellule LFP, en amperes-heures.</b><br>"
+     "C'est la valeur marquee sur la cellule : 105, 230, 280, 304, 314, "
+     "320 Ah... Elle fixe l'energie d'un pack, donc le nombre de packs, de "
+     "BMS et de cellules chiffres dans la nomenclature de l'onglet 5.<br>"
+     "Ne change pas la capacite nominale ci-dessus : utilisez le bouton "
+     "\"Caler sur des packs entiers\" pour cela."),
+    ("cell_n_serie", "Cellules en serie par pack (S)", "int", 2, 48, 1,
+     "<b>Nombre de cellules montees en serie dans un pack.</b><br>"
+     "16S est le standard des installations 48 V (16 x 3,2 V = 51,2 V "
+     "nominal, 57,6 V a pleine charge), c'est la valeur par defaut.<br>"
+     "Autres montages courants : 8S en 24 V, 15S pour rester sous une "
+     "limite de tension, 32S sur un bus haute tension. Verifiez que la "
+     "plage de tension de votre onduleur accepte le montage choisi."),
+    ("cell_v_nom", "Tension nominale d'une cellule (V)", "float", .5, 5, .05,
+     "<b>Tension nominale de la chimie utilisee, en volts.</b><br>"
+     "3,2 V pour le LFP (LiFePO4), la valeur par defaut. 3,7 V pour du "
+     "NMC, 2,3 V pour du LTO.<br>"
+     "Energie d'un pack = cellules en serie x cette tension x capacite "
+     "de la cellule."),
     ("dod", "Profondeur de decharge (0 a 1)", "float", .5, 1, .01,
      "<b>Part de la capacite nominale que l'on s'autorise a utiliser.</b><br>"
      "0,90 = on exploite 90 % et on garde 5 % de reserve en haut et en bas, "
@@ -449,13 +888,13 @@ SYSTEM_SCHEMA = [
      "<b>Part de l'energie stockee qui est reellement restituee.</b><br>"
      "Multiplie par le rendement de charge, cela donne le rendement "
      "aller-retour de la chimie seule (~97 % en LFP)."),
-    ("c_rate_charge", "Regime de charge max (C)", "float", .1, 1, .05,
+    ("c_rate_charge", "Regime de charge max (C)", "float", .01, 4, .05,
      "<b>Vitesse de charge maximale, exprimee en C (fraction de la capacite "
      "par heure).</b><br>"
      "0,5 C sur une batterie de 64 kWh = 32 kW de charge maximale, "
      "soit une charge complete en 2 heures.<br>"
      "0,5 C est la limite usuelle des cellules LFP prismatiques."),
-    ("c_rate_decharge", "Regime de decharge max (C)", "float", .1, 1, .05,
+    ("c_rate_decharge", "Regime de decharge max (C)", "float", .01, 4, .05,
      "<b>Vitesse de decharge maximale, en C.</b><br>"
      "0,5 C sur 64 kWh = 32 kW disponibles instantanement. Doit couvrir "
      "votre pointe de consommation."),
@@ -465,7 +904,7 @@ SYSTEM_SCHEMA = [
      "0,5 = a moitie pleine. N'influence que les tout premiers jours de la "
      "serie, sans effet sur le bilan annuel."),
     ("__grp3", "Reseau", None, None, None, None, ""),
-    ("p_souscrite_kva", "Puissance souscrite (kVA)", "float", 3, 60, 3,
+    ("p_souscrite_kva", "Puissance souscrite (kVA)", "float", 1, 50000, 3,
      "<b>Puissance de votre abonnement Enedis, en kVA.</b><br>"
      "Plafond du soutirage possible : au-dela, le disjoncteur saute. La "
      "simulation compte l'energie qui n'aurait pas pu etre fournie et vous "
@@ -502,7 +941,9 @@ SYSTEM_DEFAULTS = {
     "veille_w": 55.0, "veille_nuit_w": 35.0,
     "vdc_max_v": 800.0, "vmppt_min_v": 160.0, "i_max_string_a": 26.0,
     "n_mppt_par_onduleur": 2,
-    "batt_kwh_nominal": 64.3, "dod": 0.90, "eff_charge": 0.985, "eff_decharge": 0.985,
+    "batt_kwh_nominal": 64.3,
+    "cell_ah": 314.0, "cell_n_serie": 16, "cell_v_nom": 3.2,
+    "dod": 0.90, "eff_charge": 0.985, "eff_decharge": 0.985,
     "c_rate_charge": 0.5, "c_rate_decharge": 0.5, "soc_initial": 0.5,
     "p_souscrite_kva": 12.0, "injection_nulle": True,
     "recharge_reseau_hc": False, "soc_cible_hc": 0.4, "hc_debut": 2, "hc_fin": 6,
@@ -627,22 +1068,22 @@ MODULE_DEFAULTS = {"gamma_pmax": -0.0035, "beta_voc_pct_k": -0.27, "noct_u0": 25
                    "pertes_dc_pct": 8.0}
 
 ECO_SCHEMA = [
-    ("prix_kwh_achat", "Prix du kWh soutire (EUR/kWh)", "float", 0, 1.5, .001,
+    ("prix_kwh_achat", "Prix du kWh soutire (EUR/kWh)", "float", 0, 10, .001,
      "<b>Prix payes pour un kWh pris sur le reseau, taxes comprises.</b><br>"
      "Se lit sur la facture : montant consommation divise par kWh consommes. "
      "Ne comptez pas l'abonnement ici, il a son propre champ.<br>"
      "Repere 2024 : environ 0,20 EUR/kWh en tarif bleu base."),
-    ("abonnement_an", "Abonnement annuel (EUR/an)", "float", 0, 3000, 10,
+    ("abonnement_an", "Abonnement annuel (EUR/an)", "float", 0, 2000000, 10,
      "<b>Part fixe de la facture, en euros par an.</b><br>"
      "Elle reste due meme avec 100 % d'autonomie, tant que vous gardez le "
      "raccordement. Repere : 150 a 300 EUR/an selon la puissance souscrite."),
-    ("prix_kwh_revente", "Prix du kWh injecte (EUR/kWh)", "float", 0, .5, .001,
+    ("prix_kwh_revente", "Prix du kWh injecte (EUR/kWh)", "float", 0, 10, .001,
      "<b>Tarif de rachat du surplus renvoye sur le reseau.</b><br>"
      "Mettez 0 en installation autonome sans contrat d'obligation d'achat : "
      "le surplus est alors simplement perdu.<br>"
      "Sans effet si la case \"Injection nulle\" est cochee dans l'onglet 4."),
     ("facture_actuelle_an", "Facture actuelle (EUR/an)",
-     "float", 0, 30000, 50,
+     "float", 0, 100000000, 50,
      "<b>Ce que vous depensez aujourd'hui en energie, avant travaux.</b><br>"
      "Additionnez electricite, gaz, fioul, bois achete.<br><br>"
      "<b>Ce chiffre ne sert qu'au bilan du PROJET COMPLET</b>, celui qui "
@@ -653,7 +1094,7 @@ ECO_SCHEMA = [
      "l'energie que les panneaux et la batterie evitent d'acheter, a maison "
      "inchangee. C'est ce second chiffre qui doit guider un choix de "
      "panneaux, d'onduleur ou de batterie."),
-    ("cout_bois_stere", "Prix du stere de bois (EUR/stere)", "float", 0, 200, 5,
+    ("cout_bois_stere", "Prix du stere de bois (EUR/stere)", "float", 0, 5000, 5,
      "<b>Prix d'achat d'un stere de bois de chauffage.</b><br>"
      "Mettez 0 si vous le produisez vous-meme. Repere : 70 a 110 EUR/stere "
      "en livraison, moins en bois long."),
@@ -670,7 +1111,7 @@ ECO_SCHEMA = [
      "0,04 = +4 %/an. Appliquee aux economies futures dans le calcul du temps "
      "de retour : plus l'energie augmente, plus l'installation est rentable.<br>"
      "Moyenne constatee en France sur 20 ans : 3 a 5 %/an."),
-    ("duree_analyse_ans", "Horizon d'analyse (ans)", "int", 5, 40, 1,
+    ("duree_analyse_ans", "Horizon d'analyse (ans)", "int", 1, 60, 1,
      "<b>Duree sur laquelle le gain cumule est calcule, en annees.</b><br>"
      "25 ans correspond a la garantie de production usuelle des panneaux. "
      "Les onduleurs et la batterie seront probablement remplaces une fois "
@@ -679,10 +1120,26 @@ ECO_SCHEMA = [
      "pour qu'elle pese sur le bon perimetre."),
 ]
 
+#: Rendements annuels moyens sur cinq ans, dividendes reinvestis, avant impot.
+#: CHIFFRES INDICATIFS, donnes comme point de depart de la case "placement" de
+#: l'onglet 7 : ils datent de la redaction, ne sont pas actualises tout seuls et
+#: ne presagent de rien. Le S&P 500 est libelle en dollars : une part de sa
+#: performance vue d'ici n'est que du change. A corriger a la main.
+PLACEMENTS = {
+    "S&P 500 - moyenne 5 ans": 0.145,
+    "CAC 40 dividendes reinvestis - moyenne 5 ans": 0.115,
+}
+
+#: prelevement forfaitaire unique francais sur les plus-values mobilieres
+IMPOT_PLUS_VALUES = 0.30
+
+
 ECO_DEFAULTS = {"prix_kwh_achat": 0.2016, "abonnement_an": 280.0, "prix_kwh_revente": 0.0,
                 "facture_actuelle_an": 6093.0, "cout_bois_stere": 90.0,
                 "pci_bois_kwh_stere": 1500.0, "inflation_energie": 0.04,
-                "duree_analyse_ans": 25}
+                "duree_analyse_ans": 25, "horizon_tranche_ans": 10,
+                # comparaison avec un placement financier, onglet 7
+                "taux_placement": 0.145, "impot_plus_values": 0.30}
 
 
 # --------------------------------------------------------------------------
@@ -1064,8 +1521,8 @@ AUTO_QTY = {
     "kwc": "Puissance crete installee (kWc)",
     "onduleurs": "Nombre d'onduleurs",
     "batt_kwh": "Capacite batterie nominale (kWh)",
-    "cellules": "Nombre de cellules LFP (16 par pack 16S)",
-    "packs": "Nombre de packs 16S",
+    "cellules": "Nombre de cellules (composition saisie onglet 4)",
+    "packs": "Nombre de packs de batterie",
     "m2_panneaux": "Surface de modules (m2)",
     "grappes": "Nombre de grappes (strings)",
 }

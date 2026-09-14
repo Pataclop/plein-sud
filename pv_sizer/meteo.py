@@ -12,7 +12,8 @@ import numpy as np
 from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
 
-from .config import DATA_DIR, PVGIS_DATABASES, couverture_base
+from .config import (DATA_DIR, BUNDLED_DATA_DIR, PVGIS_DATABASES,
+                     couverture_base)
 
 PVGIS_URL = "https://re.jrc.ec.europa.eu/api/v5_3/seriescalc"
 TZ_LOCAL = ZoneInfo("Europe/Paris")
@@ -25,7 +26,16 @@ def cache_path(lat: float, lon: float, y0: int, y1: int, db: str) -> str:
 
 
 def default_file() -> str:
-    return os.path.join(DATA_DIR, "meteo_langoiran_2018_2023.csv.gz")
+    return trouver("meteo_langoiran_2018_2023.csv.gz") or         os.path.join(DATA_DIR, "meteo_langoiran_2018_2023.csv.gz")
+
+
+def trouver(nom: str) -> str | None:
+    """Cherche un fichier meteo dans le cache personnel puis dans les donnees livrees."""
+    for d in (DATA_DIR, BUNDLED_DATA_DIR):
+        p = os.path.join(d, nom)
+        if os.path.exists(p):
+            return p
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -160,8 +170,9 @@ def ensure_meteo(site: dict, allow_download=True, progress=None) -> dict:
     db = site.get("base_donnees", "PVGIS-SARAH3")
 
     p = cache_path(lat, lon, y0, y1, db)
-    if os.path.exists(p):
-        return load_meteo(p, lat, lon)
+    trouve = trouver(os.path.basename(p))
+    if trouve:
+        return load_meteo(trouve, lat, lon)
 
     d = default_file()
     if os.path.exists(d) and abs(lat - 44.71) < 0.15 and abs(lon + 0.39) < 0.15:

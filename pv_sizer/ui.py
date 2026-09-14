@@ -4,14 +4,14 @@ import os, re, sys, copy, csv, traceback
 import numpy as np
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QTimer
-from PyQt6.QtGui import QAction, QKeySequence, QColor, QFont
+from PyQt6.QtGui import QAction, QKeySequence, QColor, QFont, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QLabel, QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox,
     QCheckBox, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
     QGroupBox, QSplitter, QListWidget, QListWidgetItem, QMessageBox,
     QFileDialog, QProgressBar, QScrollArea, QTextEdit, QSizePolicy, QGridLayout,
-    QToolTip, QDialog, QDialogButtonBox)
+    QToolTip, QDialog, QDialogButtonBox, QInputDialog)
 
 import matplotlib
 import matplotlib.colors
@@ -20,7 +20,9 @@ matplotlib.use("QtAgg")
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
 
+from . import APP_NOM, APP_RESUME, __version__
 from . import config as C
+from . import loads as L
 from . import meteo as M
 from . import simulation as S
 
@@ -123,7 +125,7 @@ class SchemaForm(QWidget):
         elif typ == "choice":
             w = QComboBox(); w.addItems([str(x) for x in extra])
             for i, x in enumerate(extra):
-                detail = C.SHAPES_HELP.get(str(x))
+                detail = C.SHAPES_HELP.get(str(x)) or C.CHOIX_AIDE.get(str(x))
                 if detail is None and str(x) in C.PVGIS_DATABASES:
                     d = C.PVGIS_DATABASES[str(x)]
                     detail = (f"{d['resume']}<br>Annees {d['annees'][0]} a "
@@ -706,6 +708,12 @@ def table(headers, tips=None, rows=0, stretch=True):
     return t
 
 
+def milliers(x, dec=0):
+    """12345 -> '12 345'. Un espace tous les trois chiffres, jamais une
+    virgule : elle se confond avec le separateur decimal francais."""
+    return f"{x:,.{dec}f}".replace(",", " ")
+
+
 def court(txt, n=30):
     """Etiquette raccourcie pour un axe : le nom complet reste dans l'infobulle."""
     txt = str(txt)
@@ -771,9 +779,13 @@ class PostesTab(QWidget):
                 f"<b>{v['label']}</b><br>{v['help']}",
                 Qt.ItemDataRole.ToolTipRole)
         row.addWidget(self.combo_kind)
-        b_add = QPushButton("Ajouter")
-        b_add.setToolTip("Cree un poste du type choisi a gauche, avec des "
-                         "valeurs par defaut a ajuster ensuite.")
+        b_add = QPushButton("Ajouter...")
+        b_add.setToolTip(
+            "<b>Cree un nouveau poste et demande son nom.</b><br>"
+            "Le type choisi a gauche ne fixe que le modele de calcul : le nom "
+            "est libre. Pour un usage qui ne figure pas dans la liste des "
+            "types (serveur, atelier, seche-linge, borne velo...), prenez "
+            "\"Consommation generique\" et nommez-le comme vous voulez.")
         b_add.clicked.connect(self.add)
         b_del = QPushButton("Supprimer")
         b_del.setToolTip("Supprime definitivement le poste selectionne. Pour "
@@ -800,20 +812,27 @@ class PostesTab(QWidget):
             "(vehicule electrique, jacuzzi) separement.")
         self.chk_actif.stateChanged.connect(self.commit)
         self.edit_nom = QLineEdit()
-        self.edit_nom.setToolTip(
-            "Nom libre du poste, utilise dans les tableaux de resultats.")
+        aide_nom = ("<b>Nom libre du poste</b>, utilise dans les tableaux de "
+                    "resultats et dans le classement des leviers.<br>"
+                    "Il se modifie ici : la liste de gauche suit la frappe. "
+                    "Deux postes ne peuvent pas porter le meme nom, un suffixe "
+                    "est ajoute automatiquement en quittant le champ.")
+        self.edit_nom.setToolTip(aide_nom)
+        self.edit_nom.textEdited.connect(self._nom_tape)
         self.edit_nom.editingFinished.connect(self.commit)
         lab_nom = QLabel("Nom :")
-        lab_nom.setToolTip("Nom libre du poste, utilise dans les tableaux "
-                           "de resultats.")
+        lab_nom.setToolTip(aide_nom)
         head.addWidget(lab_nom); head.addWidget(self.edit_nom, 1)
         head.addWidget(self.chk_actif)
         self.rl.addLayout(head)
         self.lbl_help = QLabel(""); self.lbl_help.setWordWrap(True)
         self.lbl_help.setStyleSheet("color:#555;font-style:italic;")
         self.rl.addWidget(self.lbl_help)
+        self._build_bloc_chauffage()
+        self.rl.addWidget(self.row_preset)
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
         self.rl.addWidget(self.scroll, 1)
+        self.rl.addWidget(self.lbl_env)
         self.form = None
         split.addWidget(right)
         split.setSizes([300, 620])
@@ -847,6 +866,7 @@ class PostesTab(QWidget):
         self.form.set(p["params"])
         self.scroll.setWidget(self.form)
         self._loading = False
+        self.maj_enveloppe()
 
     def commit(self):
         if self._loading:
@@ -855,18 +875,204 @@ class PostesTab(QWidget):
         if row < 0 or row >= len(self.main.cfg["postes"]):
             return
         p = self.main.cfg["postes"][row]
-        p["nom"] = self.edit_nom.text() or p["nom"]
+        nom = self._nom_unique(self.edit_nom.text() or p["nom"], sauf=row)
+        if nom != self.edit_nom.text():
+            self.edit_nom.setText(nom)
+        p["nom"] = nom
         p["actif"] = self.chk_actif.isChecked()
         if self.form:
             p["params"].update(self.form.get())
         self.list.item(row).setText(("  " if p["actif"] else "  [off] ") + p["nom"])
+        self.maj_enveloppe()
         self.main.mark_dirty()
+
+    # ---------------- aide au dimensionnement du chauffage ----------------
+    def _build_bloc_chauffage(self):
+        """Barre de pre-reglage et synthese thermique, affichees uniquement
+        quand le poste selectionne est un poste de chauffage."""
+        self.row_preset = QWidget()
+        rl = QHBoxLayout(self.row_preset)
+        rl.setContentsMargins(0, 0, 0, 0)
+        lab = QLabel("Niveau d'isolation type :")
+        self.cb_preset_iso = QComboBox()
+        for nom in C.NIVEAUX_ISOLATION:
+            self.cb_preset_iso.addItem(nom)
+        self.cb_preset_iso.setCurrentIndex(2)
+        aide = ("<b>Remplit d'un coup les quatre parois, les ponts thermiques "
+                "et le renouvellement d'air selon l'epoque du bati.</b><br>"
+                "C'est un point de depart : chaque ligne reste modifiable "
+                "ensuite, paroi par paroi. Utile quand une seule paroi a ete "
+                "renovee (combles isoles, murs d'origine).<br>"
+                "<i>Appliquer bascule aussi le poste en mode \"besoin calcule "
+                "depuis l'enveloppe\".</i>")
+        lab.setToolTip(aide)
+        self.cb_preset_iso.setToolTip(aide)
+        b = QPushButton("Appliquer")
+        b.setToolTip(aide)
+        b.clicked.connect(self.appliquer_preset_iso)
+        rl.addWidget(lab)
+        rl.addWidget(self.cb_preset_iso, 1)
+        rl.addWidget(b)
+        self.row_preset.setVisible(False)
+
+        self.lbl_env = QLabel("")
+        self.lbl_env.setWordWrap(True)
+        self.lbl_env.setTextFormat(Qt.TextFormat.RichText)
+        self.lbl_env.setStyleSheet(
+            "background:#f1f5f9;padding:6px;border-radius:4px;")
+        self.lbl_env.setToolTip(
+            "<b>Ce que donne le descriptif du logement saisi ci-dessus.</b><br>"
+            "Le coefficient UA est la somme des surfaces multipliees par leur "
+            "coefficient de transmission, plus les ponts thermiques et le "
+            "renouvellement d'air : c'est le nombre de watts que la maison "
+            "perd par degre d'ecart avec l'exterieur.<br>"
+            "Le besoin annuel est ensuite calcule heure par heure sur la serie "
+            "meteo chargee, apports gratuits deduits.")
+        self.lbl_env.setVisible(False)
+
+    def appliquer_preset_iso(self):
+        row = self.list.currentRow()
+        if row < 0 or row >= len(self.main.cfg["postes"]):
+            return
+        p = self.main.cfg["postes"][row]
+        if p.get("kind") != "chauffage":
+            return
+        preset = C.NIVEAUX_ISOLATION.get(self.cb_preset_iso.currentText())
+        if not preset:
+            return
+        p["params"].update(copy.deepcopy(preset))
+        p["params"]["mode_besoin"] = C.MODE_BESOIN_ENVELOPPE
+        self._loading = True
+        if self.form:
+            self.form.set(p["params"])
+        self._loading = False
+        self.maj_enveloppe()
+        self.main.mark_dirty()
+
+    def maj_enveloppe(self):
+        """Recalcule et reaffiche la synthese thermique du poste courant."""
+        row = self.list.currentRow()
+        p = self.main.cfg["postes"][row] if 0 <= row < len(self.main.cfg["postes"]) else None
+        chauffage = bool(p) and p.get("kind") == "chauffage"
+        self.row_preset.setVisible(chauffage)
+        self.lbl_env.setVisible(chauffage)
+        if not chauffage:
+            return
+        par = p["params"]
+        env = L.deperditions(par)
+        ua = env["ua_total"]
+        if ua <= 0 or env["s_habitable"] <= 0:
+            self.lbl_env.setText(
+                "<b>Synthese thermique</b><br>Renseignez la surface habitable "
+                "et l'isolation des parois pour obtenir les deperditions du "
+                "logement.")
+            return
+
+        postes = [("Murs", env["ua_murs"]), ("Toiture", env["ua_toiture"]),
+                  ("Plancher", env["ua_plancher"]), ("Vitrages", env["ua_vitrages"]),
+                  ("Ponts th.", env["ua_ponts"]), ("Ventilation", env["ua_ventilation"])]
+        pire = max(postes, key=lambda x: x[1])[0]
+        cells = "".join(
+            f"<td align=right>&nbsp;<b>{nom}</b> {v:.0f} W/K "
+            f"({100 * v / ua:.0f}&nbsp;%)</td>"
+            + ("</tr><tr>" if i == 2 else "")
+            for i, (nom, v) in enumerate(postes))
+
+        lignes = [
+            f"<b>Synthese thermique</b> &nbsp; deperditions "
+            f"<b>UA = {ua:.0f} W/K</b> ({ua / env['s_habitable']:.2f} W/K par m2 "
+            f"habitable) &mdash; poste dominant : <b>{pire.lower()}</b>",
+            f"<table cellspacing=0 cellpadding=0><tr>{cells}</tr></table>",
+            f"Surfaces deduites : {env['s_murs']:.0f} m2 de murs, "
+            f"{env['s_sol']:.0f} m2 de toiture et de plancher, "
+            f"{env['s_vitree']:.0f} m2 de vitrages, {env['volume']:.0f} m3 d'air.",
+        ]
+
+        met = self.main.meteo
+        if met is None:
+            lignes.append("<i>Chargez la meteo (onglet 1) pour obtenir le besoin "
+                          "annuel correspondant.</i>")
+        else:
+            _, info = L.besoin_enveloppe(par, met)
+            besoin = info["besoin_calcule_kwh_an"]
+            p_dim = info["p_dimensionnement_kw"]
+            p_pac = float(par.get("p_pac_kw_th", 0.0))
+            if p_pac <= 0:
+                etat = f"<span style='color:{ORANGE}'>aucune puissance de PAC saisie</span>"
+            elif p_pac < p_dim * 0.95:
+                etat = (f"<span style='color:{ORANGE}'>PAC saisie {p_pac:.1f} kW : "
+                        f"insuffisante, l'appoint electrique prendra le relais</span>")
+            elif p_pac > p_dim * 1.8:
+                etat = (f"<span style='color:{ORANGE}'>PAC saisie {p_pac:.1f} kW : "
+                        f"surdimensionnee, cycles courts et COP degrade</span>")
+            else:
+                etat = (f"<span style='color:{VERT}'>PAC saisie {p_pac:.1f} kW : "
+                        f"coherent</span>")
+            lignes += [
+                f"Besoin calcule : <b>{milliers(besoin)} kWh thermiques/an</b> "
+                f"({info['besoin_par_m2']:.0f} kWh/m2/an, "
+                f"{info['heures_de_chauffe']:.0f} h de chauffe par an).",
+                f"Apports gratuits deduits : "
+                f"{milliers(info['apports_internes_kwh_an'])} kWh internes + "
+                f"{milliers(info['apports_solaires_kwh_an'])} kWh solaires par les "
+                f"vitrages. Temperature de non-chauffage equivalente : "
+                f"<b>{info['t_base_equivalente']:.1f} C</b>.",
+                f"Puissance a fournir par {info['t_ext_base']:.1f} C (heure la plus "
+                f"froide de la serie) : <b>{p_dim:.1f} kW</b> &mdash; {etat}.",
+            ]
+            if str(par.get("mode_besoin")) != C.MODE_BESOIN_ENVELOPPE:
+                lignes.append(
+                    f"<i>Le poste utilise actuellement le besoin saisi "
+                    f"({milliers(float(par.get('besoin_th_kwh_an', 0)))} kWh "
+                    f"th/an). Passez \"Origine du besoin\" sur "
+                    f"\"{C.MODE_BESOIN_ENVELOPPE}\" pour utiliser le calcul "
+                    f"ci-dessus.</i>")
+        self.lbl_env.setText("<br>".join(lignes))
+
+    def _nom_tape(self, txt):
+        """Renommage au fil de la frappe : la liste de gauche suit aussitot.
+
+        L'unicite n'est verifiee qu'en quittant le champ (commit) : ajouter un
+        suffixe a chaque lettre tapee rendrait le champ inutilisable.
+        """
+        if self._loading:
+            return
+        row = self.list.currentRow()
+        if row < 0 or row >= len(self.main.cfg["postes"]):
+            return
+        nom = txt.strip()
+        if not nom:
+            return
+        p = self.main.cfg["postes"][row]
+        p["nom"] = nom
+        self.list.item(row).setText(("  " if p.get("actif", True) else "  [off] ") + nom)
+        self.main.mark_dirty()
+
+    def _nom_unique(self, nom, sauf=None):
+        """Evite deux postes homonymes : le bilan par poste est indexe sur le
+        nom, deux postes identiques se confondraient dans les resultats."""
+        nom = (nom or "").strip() or "Nouveau poste"
+        pris = {p["nom"] for i, p in enumerate(self.main.cfg["postes"])
+                if i != sauf}
+        if nom not in pris:
+            return nom
+        i = 2
+        while f"{nom} ({i})" in pris:
+            i += 1
+        return f"{nom} ({i})"
 
     def add(self):
         kind = self.combo_kind.currentData()
         d = C.LOAD_KINDS[kind]
+        nom, ok = QInputDialog.getText(
+            self, "Nouveau poste de consommation",
+            f"Nom du poste (type : {d['label']}). Le nom est libre ; "
+            "le type ne fixe que le modele de calcul.",
+            QLineEdit.EchoMode.Normal, d["label"])
+        if not ok:
+            return
         self.main.cfg["postes"].append({
-            "nom": d["label"], "kind": kind, "actif": True,
+            "nom": self._nom_unique(nom), "kind": kind, "actif": True,
             "params": copy.deepcopy(d["defaults"])})
         self.refresh()
         self.list.setCurrentRow(len(self.main.cfg["postes"]) - 1)
@@ -907,7 +1113,7 @@ class PostesTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self, cfg_path=None):
         super().__init__()
-        self.setWindowTitle("Simulateur de dimensionnement PV + stockage")
+        self.setWindowTitle(f"{APP_NOM} - {APP_RESUME}")
         self.resize(1380, 880)
         self.cfg = C.default_config()
         self.cfg_path = cfg_path
@@ -917,6 +1123,7 @@ class MainWindow(QMainWindow):
         self._orient_libres = {}     # index de champ -> autorise a bouger
         self._orient_res = None
         self._leviers = None         # dernier classement des actions
+        self._loading_placement = False   # garde-fou des cases de placement
         self._attrib = None          # import reseau impute a chaque poste
 
         self.tabs = QTabWidget()
@@ -1405,10 +1612,31 @@ class MainWindow(QMainWindow):
     # ---------------- onglet 4 : systeme ----------------
     def _build_systeme(self):
         w = QWidget(); lay = QHBoxLayout(w)
+        gauche = QWidget(); gl = QVBoxLayout(gauche)
+        gl.setContentsMargins(0, 0, 0, 0)
         sc = QScrollArea(); sc.setWidgetResizable(True)
-        self.form_sys = SchemaForm(C.SYSTEM_SCHEMA, on_change=self.mark_dirty)
+        self.form_sys = SchemaForm(C.SYSTEM_SCHEMA, on_change=self._sys_changed)
         sc.setWidget(self.form_sys)
-        lay.addWidget(sc, 0)
+        gl.addWidget(sc, 1)
+        self.lbl_pack = QLabel("")
+        self.lbl_pack.setWordWrap(True)
+        self.lbl_pack.setToolTip(
+            "<b>Composition de la batterie, recalculee a chaque saisie.</b><br>"
+            "L'energie d'un pack se deduit des cellules : cellules en serie x "
+            "tension nominale x capacite en Ah. Elle sert a chiffrer les packs, "
+            "les BMS et les cellules dans la nomenclature de l'onglet 5, et a "
+            "dimensionner le levier \"+1 pack batterie\" de l'onglet 9.<br>"
+            "La capacite nominale reste saisie separement : c'est elle que le "
+            "moteur simule.")
+        gl.addWidget(self.lbl_pack)
+        b_pack = QPushButton("Caler la capacite sur des packs entiers")
+        b_pack.setToolTip(
+            "Remplace la capacite nominale par le multiple entier le plus "
+            "proche de l'energie d'un pack. Evite de payer un pack de plus "
+            "dans le devis pour quelques centaines de wattheures.")
+        b_pack.clicked.connect(self.caler_packs)
+        gl.addWidget(b_pack)
+        lay.addWidget(gauche, 0)
         right = QWidget(); rl = QVBoxLayout(right)
         self.txt_sys = QTextEdit(); self.txt_sys.setReadOnly(True)
         self.txt_sys.setToolTip(
@@ -1429,7 +1657,65 @@ class MainWindow(QMainWindow):
         lay.addWidget(right, 1)
         self.tabs.addTab(w, "4. Onduleurs et batterie")
 
-    # ---------------- onglet 5 : couts ----------------
+    def _sys_changed(self, *_):
+        self.mark_dirty()
+        self.maj_pack()
+
+    def _sys_courant(self) -> dict:
+        """Systeme tel qu'il est saisi a l'instant dans le formulaire."""
+        sy = dict(self.cfg["systeme"])
+        if getattr(self, "form_sys", None) is not None:
+            sy.update(self.form_sys.get())
+        return sy
+
+    def maj_pack(self):
+        """Etiquette vivante sous le formulaire : energie d'un pack et nombre
+        de packs implique par la capacite nominale saisie."""
+        if getattr(self, "lbl_pack", None) is None:
+            return
+        sy = self._sys_courant()
+        pack = S.kwh_par_pack({"systeme": sy})
+        ns = S.cellules_par_pack({"systeme": sy})
+        v = float(sy.get("cell_v_nom", 3.2))
+        ah = float(sy.get("cell_ah", 314.0))
+        batt = float(sy.get("batt_kwh_nominal", 0.0))
+        txt = (f"<b>1 pack = {ns}S x {v:.2f} V x {ah:.0f} Ah = "
+               f"{pack:.2f} kWh</b> ({ns * v:.1f} V nominal, "
+               f"{ns * v * 1.125:.1f} V a pleine charge)<br>")
+        if batt <= 0:
+            txt += "Capacite nominale nulle : aucun pack chiffre."
+        else:
+            exact = batt / pack
+            packs = max(int(np.ceil(exact - 0.02)), 1)
+            txt += (f"{batt:.1f} kWh nominaux = <b>{exact:.2f} pack(s)</b>, "
+                    f"factures {packs} pack(s) et {packs * ns} cellules.")
+            if abs(exact - round(exact)) > 0.02:
+                txt += (f"<br><span style='color:{ORANGE}'>Compte non rond : "
+                        f"{packs} packs donnent {packs * pack:.1f} kWh.</span>")
+        self.lbl_pack.setText(txt)
+
+    def caler_packs(self):
+        """Arrondit la capacite nominale au multiple entier le plus proche de
+        l'energie d'un pack."""
+        sy = self._sys_courant()
+        pack = S.kwh_par_pack({"systeme": sy})
+        batt = float(sy.get("batt_kwh_nominal", 0.0))
+        if batt <= 0:
+            self.statusBar().showMessage(
+                "Capacite nominale nulle : rien a caler.", 4000)
+            return
+        packs = max(int(round(batt / pack)), 1)
+        # au dixieme : c'est la precision du champ de saisie, sinon la
+        # configuration et le formulaire divergent des le premier pull
+        val = round(packs * pack, 1)
+        self.form_sys.set({"batt_kwh_nominal": val})
+        self.cfg["systeme"]["batt_kwh_nominal"] = val
+        self.maj_pack()
+        self.mark_dirty()
+        self.statusBar().showMessage(
+            f"Capacite calee sur {packs} pack(s) : {val:.2f} kWh nominaux. "
+            f"F5 pour resimuler.", 6000)
+
     # ---------------- onglet 5 : couts ----------------
     #   Deux perimetres, et c'est toute la raison d'etre des categories :
     #     * l'INSTALLATION SOLAIRE (panneaux, onduleurs, batterie, cablage,
@@ -1968,15 +2254,97 @@ class MainWindow(QMainWindow):
         self.sp_seuil_tranche.valueChanged.connect(self._seuil_change)
         row.addWidget(lab_s)
         row.addWidget(self.sp_seuil_tranche)
+
+        lab_h = QLabel("Tranche jugee sur :")
+        self.sp_horizon_tranche = QSpinBox()
+        self.sp_horizon_tranche.setRange(1, 60)
+        self.sp_horizon_tranche.setValue(10)
+        self.sp_horizon_tranche.setSuffix(" ans")
+        aide_horizon = (
+            "<b>Duree sur laquelle une TRANCHE est jugee.</b><br>"
+            "Distincte de l'horizon d'analyse du projet entier (onglet 5, "
+            "25 ans par defaut) : on accorde 25 ans a des panneaux garantis "
+            "25 ans, mais on n'attend pas aussi longtemps pour decider d'un "
+            "pack de batterie de plus, qui sera probablement remplace "
+            "avant.<br>"
+            "Tout ce qui parle de tranche s'y cale : le gain net affiche, le "
+            "rendement interne, la comparaison avec un placement, et la "
+            "mention <b>&gt; horizon</b> des tranches non remboursees a "
+            "temps.<br>"
+            "Plus l'horizon est court, plus le jugement est severe.")
+        lab_h.setToolTip(aide_horizon)
+        self.sp_horizon_tranche.setToolTip(aide_horizon)
+        self.sp_horizon_tranche.valueChanged.connect(self._horizon_tranche_change)
+        row.addWidget(lab_h)
+        row.addWidget(self.sp_horizon_tranche)
         row.addStretch(1)
         lay.addLayout(row)
+
+        # --- comparaison avec un placement financier ---
+        rowp = QHBoxLayout()
+        aide_placement = (
+            "<b>A quoi renoncez-vous en achetant cette tranche ?</b><br>"
+            "Les memes euros places rapporteraient aussi. Une tranche qui se "
+            "rembourse en 12 ans a un rendement d'environ 8 %/an : si un "
+            "placement fait mieux, l'argent est mieux la-bas.<br>"
+            "Le taux est brut, avant impot : la case suivante s'en charge.<br>"
+            "<i>Les valeurs proposees sont des moyennes sur cinq ans, donnees "
+            "comme point de depart. Elles ne sont pas actualisees toutes "
+            "seules et ne presagent de rien : corrigez-les.</i>")
+        lab_p = QLabel("Rendement d'un placement :")
+        lab_p.setToolTip(aide_placement)
+        rowp.addWidget(lab_p)
+        self.cb_placement = QComboBox()
+        self.cb_placement.setToolTip(aide_placement)
+        for nom, taux in C.PLACEMENTS.items():
+            self.cb_placement.addItem(f"{nom} ({100 * taux:.1f} %)", taux)
+        self.cb_placement.addItem("Taux personnalise", None)
+        self.cb_placement.currentIndexChanged.connect(self._placement_choisi)
+        rowp.addWidget(self.cb_placement)
+        self.sp_placement = QDoubleSpinBox()
+        self.sp_placement.setRange(0, 40)
+        self.sp_placement.setDecimals(1)
+        self.sp_placement.setSingleStep(.5)
+        self.sp_placement.setSuffix(" %/an brut")
+        self.sp_placement.setToolTip(aide_placement)
+        self.sp_placement.valueChanged.connect(self._placement_change)
+        rowp.addWidget(self.sp_placement)
+
+        aide_impot = (
+            "<b>Impot preleve sur la plus-value au moment de la revente.</b><br>"
+            "30 % = prelevement forfaitaire unique francais (17,2 % de "
+            "prelevements sociaux + 12,8 % d'impot). Mettez 0 pour un PEA de "
+            "plus de cinq ans hors prelevements sociaux, ou pour comparer en "
+            "brut.<br>"
+            "La comparaison serait faussee sans cela : un kWh que l'on "
+            "n'achete pas n'est pas imposable, une plus-value l'est.")
+        lab_i = QLabel("Impot sur les gains :")
+        lab_i.setToolTip(aide_impot)
+        rowp.addWidget(lab_i)
+        self.sp_impot = QDoubleSpinBox()
+        self.sp_impot.setRange(0, 60)
+        self.sp_impot.setDecimals(1)
+        self.sp_impot.setSingleStep(.8)
+        self.sp_impot.setSuffix(" %")
+        self.sp_impot.setToolTip(aide_impot)
+        self.sp_impot.valueChanged.connect(self._placement_change)
+        rowp.addWidget(self.sp_impot)
+        self.lbl_placement = QLabel("")
+        self.lbl_placement.setToolTip(
+            "Rendement annuel du placement une fois l'impot de sortie paye, "
+            "sur la duree de l'horizon d'analyse. C'est ce taux-la qu'une "
+            "tranche doit battre.")
+        rowp.addWidget(self.lbl_placement)
+        rowp.addStretch(1)
+        lay.addLayout(rowp)
         self.tbl_sweep = table(
             ["Valeur testee", "Autonomie (%)", "Production (kWh/an)",
              "Import reseau (kWh/an)", "Ecrete (kWh/an)",
              "Cout installation solaire (EUR)", "EUR/Wc",
              "Retour cumule (ans)",
              "Tranche", "Cout de la tranche (EUR)", "Gain de la tranche (EUR/an)",
-             "RETOUR DE LA TRANCHE (ans)", "ROI marginal"],
+             "RETOUR DE LA TRANCHE (ans)", "ROI marginal",
+             "Rendement de la tranche (%/an)", "Tranche moins placement (EUR)"],
             tips=[
                 "Valeur donnee au parametre balaye pour cette simulation. "
                 "La meilleure ligne est en gras.",
@@ -2024,7 +2392,19 @@ class MainWindow(QMainWindow):
                 "apres la duree d'analyse.",
                 "Euros economises chaque annee par euro supplementaire investi "
                 "sur cette tranche. C'est l'inverse du retour de la tranche : "
-                "0,25 = remboursement en 4 ans."])
+                "0,25 = remboursement en 4 ans.",
+                "<b>Taux de rendement interne de cette seule tranche</b>, "
+                "inflation de l'energie comprise, sur l'horizon d'analyse.<br>"
+                "C'est le taux qu'il faudrait obtenir en bourse pour faire "
+                "aussi bien : compare-le au taux net affiche au-dessus du "
+                "tableau. En vert, la tranche gagne ; en rouge, le placement.<br>"
+                "<b>jamais</b> : la tranche ne rembourse meme pas son cout "
+                "nominal, son rendement est negatif.",
+                "<b>Ce que cette tranche laisse de plus (ou de moins) que les "
+                "memes euros places</b>, au bout de l'horizon d'analyse.<br>"
+                "Positif : acheter la tranche. Negatif : placer l'argent.<br>"
+                "Le materiel est compte sans valeur de revente au bout, le "
+                "capital place est suppose recupere."])
         lay.addWidget(self.tbl_sweep, 1)
         sub = QTabWidget()
         self.cv_sweep = MplCanvas(9, 4)
@@ -2059,6 +2439,18 @@ class MainWindow(QMainWindow):
         self.cv_sweep_tranche.set_plot(self.draw_sweep_tranche,
                                        "Balayage : amortissement par tranche")
         sub.addTab(self.cv_sweep_tranche, "Amortissement par tranche")
+
+        self.cv_bourse = MplCanvas(9, 4)
+        self.cv_bourse.setToolTip(
+            "<b>Cette tranche, ou les memes euros places ?</b><br>"
+            "Une tranche remboursee en 12 ans rapporte environ 8 %/an. Si un "
+            "placement fait mieux, net d'impot, l'argent est mieux la-bas : "
+            "l'installation s'arrete avant.<br>"
+            "Le taux se saisit au-dessus du tableau ; changer le taux "
+            "redessine tout sans relancer la moindre simulation." + HINT)
+        self.cv_bourse.set_plot(self.draw_bourse,
+                                "Balayage : tranche contre placement")
+        sub.addTab(self.cv_bourse, "Tranche ou placement")
         sub.addTab(self._build_grille(), "Optimum PV x batterie")
         lay.addWidget(sub, 1)
         self.tabs.addTab(w, "7. Optimisation")
@@ -2095,7 +2487,7 @@ class MainWindow(QMainWindow):
 
         lab2 = QLabel("Talon supprime :")
         self.sp_lev_talon = QDoubleSpinBox()
-        self.sp_lev_talon.setRange(0, 1000); self.sp_lev_talon.setValue(50)
+        self.sp_lev_talon.setRange(0, 1000000); self.sp_lev_talon.setValue(50)
         self.sp_lev_talon.setDecimals(0); self.sp_lev_talon.setSuffix(" W")
         aide_talon = ("<b>Watts permanents que ferait gagner un remplacement "
                       "d'appareils de fond.</b><br>"
@@ -2108,7 +2500,7 @@ class MainWindow(QMainWindow):
 
         lab3 = QLabel("Cout de ce remplacement :")
         self.sp_lev_cout = QDoubleSpinBox()
-        self.sp_lev_cout.setRange(0, 50000); self.sp_lev_cout.setValue(900)
+        self.sp_lev_cout.setRange(0, 50000000); self.sp_lev_cout.setValue(900)
         self.sp_lev_cout.setDecimals(0); self.sp_lev_cout.setSingleStep(50)
         self.sp_lev_cout.setSuffix(" EUR")
         aide_cout = ("<b>Prix suppose du remplacement des appareils de fond.</b><br>"
@@ -2895,7 +3287,9 @@ class MainWindow(QMainWindow):
         self.update_aide_annees()
         self.form_module.set(self.cfg["module"])
         self.form_sys.set(self.cfg["systeme"])
+        self.maj_pack()
         self.form_eco.set(self.cfg["economie"])
+        self._sync_placement()
         self.refresh_champs()
         self.refresh_bom()
         self.tab_postes.refresh()
@@ -3290,7 +3684,9 @@ class MainWindow(QMainWindow):
             f"Puissance PV DC maximale atteinte : {self.res['pv_dc'].max():.1f} kW "
             f"(soit {100 * self.res['pv_dc'].max() / max(k['kwc'], 1e-9):.0f} % du crete)<br>"
             f"<b>Batterie</b> : {s['batt_kwh_nominal']:.1f} kWh nominaux, "
-            f"<b>{d['utile']:.1f} kWh utiles</b><br>"
+            f"<b>{d['utile']:.1f} kWh utiles</b> &bull; "
+            f"{S.cellules_par_pack(self.cfg)}S x {s.get('cell_ah', 314):.0f} Ah "
+            f"= {S.kwh_par_pack(self.cfg):.2f} kWh/pack<br>"
             f"Energie restituee : {f(d['decharge'].sum() / k['n_years'])} kWh/an &bull; "
             f"<b>{k['cycles_batterie_an']:.0f} cycles pleins/an</b> &bull; "
             f"duree de vie estimee "
@@ -3779,7 +4175,7 @@ class MainWindow(QMainWindow):
         ajoute un de plus ou j'arrete la ?".
         """
         statut = o.get("statut", "depart")
-        horizon = int(self.cfg["economie"].get("duree_analyse_ans", 25))
+        horizon = S.horizon_tranches(self.cfg)
         r = o.get("retour_tranche")
         if statut == "depart":
             txt, coul, tip = "-", None, "Premiere valeur testee : rien avant elle."
@@ -3830,6 +4226,23 @@ class MainWindow(QMainWindow):
     def show_sweep(self, var, out):
         if not out:
             return
+        self._sweep_out, self._sweep_var = out, var
+        self._sweep_libelle = self.cb_sweep.currentText()
+        self._appliquer_placement()
+        self.remplir_table_sweep()
+        self.draw_sweep()
+        self.draw_sweep_bar()
+        self.draw_sweep_tranche()
+        self.draw_bourse()
+        self.tabs.setCurrentIndex(6)
+
+    def remplir_table_sweep(self):
+        """Remplit le tableau depuis le balayage en memoire. Separe de
+        show_sweep : changer le taux de placement le redessine sans relancer
+        la moindre simulation."""
+        out = getattr(self, "_sweep_out", None)
+        if not out:
+            return
         t = self.tbl_sweep; t.setRowCount(len(out))
         f = lambda v, n=0: f"{v:,.{n}f}".replace(",", " ")
         best, best_eco = self._optimums(out)
@@ -3866,12 +4279,26 @@ class MainWindow(QMainWindow):
                     "la nomenclature) : le rapport gain/surcout n'a pas de "
                     "sens ici. Comparez directement l'autonomie.")
             t.setItem(r, 12, it_roi)
-        self._sweep_out, self._sweep_var = out, var
-        self._sweep_libelle = self.cb_sweep.currentText()
-        self.draw_sweep()
-        self.draw_sweep_bar()
-        self.draw_sweep_tranche()
-        self.tabs.setCurrentIndex(6)
+
+            # --- les deux colonnes de la comparaison avec un placement ---
+            t.setItem(r, 13, self._cell_tri(o))
+            ecart = o.get("ecart_bourse")
+            it_ec = item("-" if ecart is None
+                         else f"{ecart:+,.0f}".replace(",", " "),
+                         align_right=True,
+                         couleur=None if ecart is None
+                         else (VERT if ecart > 0 else ROUGE))
+            if ecart is not None:
+                an = o.get("annee_perte") if ecart <= 0 else o.get("annee_bascule")
+                if ecart <= 0 and an is not None:
+                    it_ec.setToolTip(
+                        f"Le placement repasse devant a partir de l'annee "
+                        f"{an:.1f} et le reste jusqu'a l'horizon.")
+                elif an is not None:
+                    it_ec.setToolTip(
+                        f"La tranche passe devant le placement a l'annee "
+                        f"{an:.1f} et ne se fait plus rattraper.")
+            t.setItem(r, 14, it_ec)
 
     def draw_sweep(self, cv=None):
         """Balayage d'un parametre : profils mensuels et rentabilite marginale."""
@@ -4077,6 +4504,284 @@ class MainWindow(QMainWindow):
                     cumul=False)
         c.draw()
 
+    def _horizon_tranche_change(self, *_):
+        """Change la duree de jugement des tranches. Rien n'est resimule : le
+        cout et le gain de chaque tranche sont deja connus, seule la duree
+        pendant laquelle on les cumule change."""
+        horizon = int(self.sp_horizon_tranche.value())
+        self.cfg["economie"]["horizon_tranche_ans"] = horizon
+        # un seuil de remboursement au-dela de l'horizon n'aurait aucun effet :
+        # une tranche non remboursee a temps est deja comptee comme perdue
+        if self.sp_seuil_tranche.value() > horizon:
+            self.sp_seuil_tranche.blockSignals(True)
+            self.sp_seuil_tranche.setValue(horizon)
+            self.sp_seuil_tranche.blockSignals(False)
+        self.sp_seuil_tranche.setMaximum(horizon)
+        self._placement_change()          # reaffiche le taux net sur la duree
+        if getattr(self, "_sweep_out", None):
+            self._appliquer_tranches()
+            self._appliquer_placement()
+            self.remplir_table_sweep()
+            self.draw_sweep_tranche()
+            self.draw_bourse()
+
+    def _appliquer_tranches(self):
+        """Recalcule cout, gain et retour de chaque tranche sur le balayage
+        deja en memoire."""
+        out = getattr(self, "_sweep_out", None)
+        if not out:
+            return
+        for o, t in zip(out, S.tranches_successives(out, self.cfg)):
+            o.update(t)
+
+    # ---------------- tranche ou placement financier ----------------
+    def _placement_choisi(self, *_):
+        """Un preset remplit la case du taux ; personnalise la laisse libre."""
+        taux = self.cb_placement.currentData()
+        if taux is None:
+            return
+        self.sp_placement.blockSignals(True)
+        self.sp_placement.setValue(100.0 * float(taux))
+        self.sp_placement.blockSignals(False)
+        self._placement_change()
+
+    def _placement_change(self, *_):
+        """Le taux ne relance aucune simulation : il ne change que la lecture
+        des tranches deja calculees."""
+        if getattr(self, "sp_placement", None) is None:
+            return
+        taux = self.sp_placement.value() / 100.0
+        impot = self.sp_impot.value() / 100.0
+        self.cfg["economie"]["taux_placement"] = taux
+        self.cfg["economie"]["impot_plus_values"] = impot
+        # le preset cesse de correspondre des que la case est retouchee
+        if not getattr(self, "_loading_placement", False):
+            attendu = self.cb_placement.currentData()
+            if attendu is not None and abs(float(attendu) - taux) > 1e-9:
+                self.cb_placement.blockSignals(True)
+                self.cb_placement.setCurrentIndex(self.cb_placement.count() - 1)
+                self.cb_placement.blockSignals(False)
+        horizon = S.horizon_tranches(self.cfg)
+        net = S.taux_net_annualise(taux, impot, horizon)
+        self.lbl_placement.setText(
+            f"<span style='color:{BLEU}'>soit <b>{100 * net:.2f} %/an net "
+            f"d'impot</b> sur {horizon} ans</span>")
+        if getattr(self, "_sweep_out", None):
+            self._appliquer_placement()
+            self.remplir_table_sweep()
+            self.draw_sweep_tranche()
+            self.draw_bourse()
+
+    def _sync_placement(self):
+        """Recale les cases sur la configuration chargee."""
+        if getattr(self, "sp_placement", None) is None:
+            return
+        e = self.cfg["economie"]
+        horizon = S.horizon_tranches(self.cfg)
+        self.sp_horizon_tranche.blockSignals(True)
+        self.sp_horizon_tranche.setValue(horizon)
+        self.sp_horizon_tranche.blockSignals(False)
+        self.sp_seuil_tranche.setMaximum(horizon)
+        if self.sp_seuil_tranche.value() > horizon:
+            self.sp_seuil_tranche.setValue(horizon)
+        taux = float(e.get("taux_placement", 0.145))
+        impot = float(e.get("impot_plus_values", C.IMPOT_PLUS_VALUES))
+        self._loading_placement = True
+        for w, v in ((self.sp_placement, 100.0 * taux),
+                     (self.sp_impot, 100.0 * impot)):
+            w.blockSignals(True); w.setValue(v); w.blockSignals(False)
+        i = next((k for k in range(self.cb_placement.count())
+                  if self.cb_placement.itemData(k) is not None
+                  and abs(float(self.cb_placement.itemData(k)) - taux) < 1e-9),
+                 self.cb_placement.count() - 1)
+        self.cb_placement.blockSignals(True)
+        self.cb_placement.setCurrentIndex(i)
+        self.cb_placement.blockSignals(False)
+        self._placement_change()
+        self._loading_placement = False
+
+    def _appliquer_placement(self):
+        """Recalcule la comparaison sur le balayage deja en memoire."""
+        out = getattr(self, "_sweep_out", None)
+        if not out:
+            return
+        taux = self.sp_placement.value() / 100.0
+        impot = self.sp_impot.value() / 100.0
+        for o, cmp_ in zip(out, S.comparer_placement(out, self.cfg, taux, impot)):
+            o.update(cmp_)
+
+    def draw_bourse(self, cv=None):
+        """La question posee autrement : ces euros-la, dans une tranche de plus
+        ou sur un compte-titres ?"""
+        out = getattr(self, "_sweep_out", None)
+        c = self._cv(cv, self.cv_bourse); c.clear()
+        if not out or len(out) < 2:
+            ax = c.fig.add_subplot(111)
+            ax.text(.5, .5, "Lancez un balayage d'au moins deux valeurs.\n\n"
+                            "Chaque tranche sera comparee a un placement du "
+                            "meme montant.",
+                    ha="center", va="center", fontsize=9, color="#94a3b8")
+            ax.set_xticks([]); ax.set_yticks([])
+            c.draw()
+            return
+        if all(o.get("tri_tranche") is None for o in out):
+            self._appliquer_placement()
+
+        libelle = getattr(self, "_sweep_libelle", None) or self.cb_sweep.currentText()
+        horizon = S.horizon_tranches(self.cfg)
+        taux = self.sp_placement.value() / 100.0
+        impot = self.sp_impot.value() / 100.0
+        net = S.taux_net_annualise(taux, impot, horizon)
+        x = np.arange(len(out))
+        etiq = [f"{o['valeur']:g}" for o in out]
+        etiq_tr = ["depart" if i == 0 else
+                   (f"+{o['delta_valeur']:g}" if o.get("delta_valeur") is not None
+                    else "-") for i, o in enumerate(out)]
+
+        # --- 1. le rendement de chaque tranche, contre celui du placement ----
+        ax1 = c.fig.add_subplot(2, 2, 1)
+        tri = np.array([np.nan if o.get("tri_tranche") is None
+                        else 100.0 * o["tri_tranche"] for o in out], dtype=float)
+        ax1.plot(x, tri, color=BLEU, marker="o", ms=6, lw=2.4,
+                 label="Rendement de la tranche (TRI)")
+        perdues = [i for i, o in enumerate(out)
+                   if o.get("cout_tranche") and o.get("tri_tranche") is None]
+        if perdues:
+            bas = float(np.nanmin(tri)) if np.any(np.isfinite(tri)) else 0.0
+            bas = min(bas, 100 * net)
+            ax1.plot(perdues, [bas] * len(perdues), marker="x", ls="none",
+                     ms=9, mew=2.4, color=ROUGE,
+                     label="ne rembourse meme pas son cout")
+        ax1.axhline(100 * net, color=VERT, ls="--", lw=1.8)
+        # sous la ligne, sinon l'etiquette se pose dessus
+        ax1.text(len(out) - .5, 100 * net,
+                 f"placement : {100 * net:.1f} %/an net ", color=VERT,
+                 fontsize=7, va="top", ha="right")
+        ax1.set_ylabel("%/an")
+        ax1.set_title("Rendement annuel : la tranche ou le placement ?",
+                      fontsize=9)
+        ax1.legend(fontsize=7, frameon=False, loc="upper right")
+
+        # --- 2. ecart cumule annee par annee, tranche par tranche -----------
+        ax2 = c.fig.add_subplot(2, 2, 2)
+        cmap = matplotlib.colormaps["viridis"]
+        traces = 0
+        for i, o in enumerate(out):
+            cum, bourse = o.get("cumul_tranche"), o.get("cumul_bourse")
+            if not cum or not bourse:
+                continue
+            col = matplotlib.colors.to_hex(cmap(.88 * i / max(len(out) - 1, 1)))
+            ecart = np.asarray(cum, dtype=float) - np.asarray(bourse, dtype=float)
+            ax2.plot(np.arange(len(ecart)), ecart, lw=1.7, color=col,
+                     label=f"{etiq[i]} ({etiq_tr[i]})")
+            traces += 1
+        ax2.axhline(0, color=ROUGE, lw=1.3)
+        ax2.set_xlabel("annees")
+        ax2.set_ylabel("EUR")
+        ax2.set_title("Tranche moins placement, annee par annee", fontsize=9)
+        ax2.grid(alpha=.25, ls=":")
+        if 0 < traces <= 9 or cv is not None:
+            ax2.legend(fontsize=6.5, frameon=False, ncol=2, title=libelle,
+                       title_fontsize=6.5)
+
+        # --- 3. le solde a l'horizon, en euros ------------------------------
+        ax3 = c.fig.add_subplot(2, 2, 3)
+        net_tr = np.array([np.nan if o.get("gain_tranche_replace") is None
+                           else float(o["gain_tranche_replace"]) for o in out])
+        net_b = np.array([np.nan if o.get("gain_bourse") is None
+                          else float(o["gain_bourse"]) for o in out])
+        ax3.plot(x, net_tr, color=BLEU, marker="o", ms=5.5, lw=2.4,
+                 label="la tranche, economies replacees")
+        ax3.plot(x, net_b, color="#7c3aed", marker="D", ms=4.5, lw=2, ls="--",
+                 label="les memes euros places")
+        # la zone entre les deux courbes dit tout : verte tant que la tranche
+        # est devant, rouge des qu'elle passe derriere
+        fini = np.isfinite(net_tr) & np.isfinite(net_b)
+        if np.any(fini):
+            ax3.fill_between(x, net_tr, net_b, where=fini & (net_tr >= net_b),
+                             color=VERT, alpha=.16, interpolate=True)
+            ax3.fill_between(x, net_tr, net_b, where=fini & (net_tr < net_b),
+                             color=ROUGE, alpha=.14, interpolate=True)
+        # le croisement, interpole entre les deux options qui l'encadrent
+        for i in range(1, len(out)):
+            if not (fini[i] and fini[i - 1]):
+                continue
+            d0, d1 = net_tr[i - 1] - net_b[i - 1], net_tr[i] - net_b[i]
+            if (d0 >= 0) == (d1 >= 0):
+                continue
+            xc = (i - 1) + (d0 / (d0 - d1) if d0 != d1 else .5)
+            yc = np.interp(xc, x[fini], net_b[fini])
+            ax3.plot([xc], [yc], marker="v", ms=9, color=ROUGE, zorder=5)
+            ax3.axvline(xc, color=ROUGE, ls=":", lw=1.2, alpha=.8)
+            ax3.annotate("la bourse passe devant", (xc, yc),
+                         textcoords="offset points", xytext=(4, 10),
+                         fontsize=7, color=ROUGE)
+            break
+        ax3.axhline(0, color="black", lw=.7)
+        ax3.set_ylabel("EUR")
+        ax3.set_title(f"Ce que chaque option laisse au bout de {horizon} ans",
+                      fontsize=9)
+        ax3.legend(fontsize=7, frameon=False, loc="upper right")
+        ax3.set_xlabel(libelle)
+
+        for ax in (ax1, ax3):
+            ax.set_xticks(x)
+            ax.set_xticklabels([f"{e}\n{t}" for e, t in zip(etiq, etiq_tr)],
+                               fontsize=6.5, rotation=45 if len(out) > 8 else 0)
+            ax.grid(axis="y", alpha=.2, ls=":")
+
+        # --- 4. la conclusion ------------------------------------------------
+        ax4 = c.fig.add_subplot(2, 2, 4)
+        ax4.axis("off")
+        for i, ligne in enumerate(self._texte_bourse(out, libelle, horizon, net)):
+            gras = ligne.startswith("*")
+            ax4.text(0.0, 0.96 - i * 0.115, ligne.lstrip("*"), va="top",
+                     fontsize=8.2 if gras else 7.6,
+                     fontweight="bold" if gras else "normal",
+                     color=BLEU if gras else "#334155", wrap=True,
+                     transform=ax4.transAxes)
+        c.fig.suptitle(
+            f"Tranche contre placement a {self.sp_placement.value():.1f} %/an "
+            f"brut, soit {100 * net:.1f} %/an net d'impot",
+            fontsize=9.5, color=BLEU)
+        c.draw()
+
+    def _texte_bourse(self, out, libelle, horizon, net):
+        """La conclusion de la comparaison, en francais."""
+        f = lambda v: f"{v:,.0f}".replace(",", " ")
+        i_stop = S.derniere_tranche_vs_placement(out)
+        lignes = []
+        if i_stop is not None and out[i_stop].get("statut") != "depart":
+            o = out[i_stop]
+            lignes.append(f"*Face a un placement a {100 * net:.1f} %/an net :")
+            lignes.append(f"   aller jusqu'a {libelle} = {o['valeur']:g}, "
+                          f"{f(o['capex'])} EUR. Au-dela, la bourse fait mieux.")
+        elif i_stop is not None:
+            lignes.append("*Des la premiere tranche, le placement fait mieux.")
+            lignes.append(f"   A {100 * net:.1f} %/an net, il vaut mieux ne pas "
+                          f"grossir l'installation au-dela du point de depart.")
+        else:
+            lignes.append("*Aucune tranche ne bat le placement.")
+            lignes.append("   Le balayage part deja trop haut, ou le taux saisi "
+                          "est optimiste.")
+
+        gagnantes = [o for o in out if o.get("bat_bourse")]
+        perdantes = [o for o in out if o.get("bat_bourse") is False]
+        if gagnantes:
+            ecart = sum(o.get("ecart_bourse") or 0.0 for o in gagnantes)
+            lignes.append(f"*{len(gagnantes)} tranche(s) battent le placement,")
+            lignes.append(f"   de {f(ecart)} EUR cumules a {horizon} ans.")
+        if perdantes:
+            ecart = sum(o.get("ecart_bourse") or 0.0 for o in perdantes)
+            lignes.append(f"*{len(perdantes)} tranche(s) perdent contre lui,")
+            lignes.append(f"   de {f(-ecart)} EUR a {horizon} ans.")
+        lignes.append("")
+        lignes.append("Le materiel est compte sans valeur de revente au bout et")
+        lignes.append("le capital place est suppose recupere. La comparaison")
+        lignes.append("ignore le risque : un kWh economise est certain, un")
+        lignes.append("rendement boursier passe ne l'est pas.")
+        return lignes
+
     def _seuil_change(self, *_):
         """Le seuil ne change aucun calcul : il deplace seulement la limite
         que la vue par tranche met en evidence."""
@@ -4103,7 +4808,7 @@ class MainWindow(QMainWindow):
             return
 
         libelle = getattr(self, "_sweep_libelle", None) or self.cb_sweep.currentText()
-        horizon = int(self.cfg["economie"].get("duree_analyse_ans", 25))
+        horizon = S.horizon_tranches(self.cfg)
         x = np.arange(len(out))
         etiq = [f"{o['valeur']:g}" for o in out]
 
@@ -4176,6 +4881,15 @@ class MainWindow(QMainWindow):
         ax3.set_ylabel("EUR")
         ax3.set_title(f"Ce que la tranche aura rapporte, net, a {horizon} ans",
                       fontsize=9)
+        # Pas de courbe de placement ICI : ces barres comptent des economies
+        # qui dorment, alors qu'un capital place capitalise. Les comparer
+        # directement donnerait une reponse differente de celle de l'onglet
+        # "Tranche ou placement", ou les deux sont mises sur le meme pied.
+        ax3.text(0.99, 0.95,
+                 "comparaison avec un placement :\n"
+                 "onglet \"Tranche ou placement\"",
+                 transform=ax3.transAxes, ha="right", va="top",
+                 fontsize=6.5, color="#7c3aed", style="italic")
 
         for ax in (ax1, ax2, ax3):
             ax.set_xticks(x)
@@ -4211,6 +4925,27 @@ class MainWindow(QMainWindow):
                     xfmt=lambda i: f"{libelle} = {etiq[i]} ({etiq_tr[i]})",
                     titre="Tranche", cumul=False)
         c.draw()
+
+    def _cell_tri(self, o):
+        """Rendement interne de la tranche, colore selon qu'il bat ou non le
+        placement saisi."""
+        tri = o.get("tri_tranche")
+        if o.get("statut") in ("depart", "sans_surcout") or o.get("cout_tranche") is None:
+            return item("-", align_right=True)
+        if tri is None:
+            it = item("jamais", align_right=True, couleur=ROUGE)
+            it.setToolTip("Cette tranche ne rembourse meme pas son cout "
+                          "nominal sur l'horizon : son rendement est negatif, "
+                          "n'importe quel placement fait mieux.")
+            return it
+        gagne = bool(o.get("bat_bourse"))
+        it = item(f"{100 * tri:.1f} %", align_right=True,
+                  couleur=VERT if gagne else ROUGE, bold=gagne)
+        it.setToolTip(
+            "Taux qu'il faudrait obtenir en bourse pour faire aussi bien "
+            "que cette tranche." if gagne else
+            "Le placement saisi rapporte davantage que cette tranche.")
+        return it
 
     def _texte_tranches(self, out, libelle, horizon):
         """La conclusion du balayage, en francais : jusqu'ou pousser."""
@@ -4367,7 +5102,11 @@ class MainWindow(QMainWindow):
 
 def run(cfg_path=None):
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NOM)
+    app.setApplicationVersion(__version__)
     app.setStyle("Fusion")
+    if os.path.exists(C.ICONE):
+        app.setWindowIcon(QIcon(C.ICONE))
     win = MainWindow(cfg_path)
     win.show()
     sys.exit(app.exec())

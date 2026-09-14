@@ -9,6 +9,7 @@ contre un hiver 2021 froid.
 """
 from __future__ import annotations
 import numpy as np
+from . import config as C
 from .config import DAILY_SHAPES
 
 
@@ -130,8 +131,186 @@ def _generique(p, meteo):
 T_CONSIGNE_REF = 19.5
 
 
-def _chauffage(p, meteo):
-    t = moving_average(meteo["T2m"], p.get("inertie_h", 6))
+# --------------------------------------------------------------------------
+# Enveloppe du batiment : du descriptif de la maison au besoin de chaleur
+#
+# Le modele est celui des degres-heures, applique heure par heure :
+#
+#     besoin(h) = UA x (T_interieure - T_exterieure(h)) - apports_gratuits(h)
+#
+# borne a zero (on ne refroidit pas). UA est le coefficient de deperdition du
+# logement, en watts perdus par degre d'ecart ; les apports gratuits sont la
+# chaleur des occupants et des appareils, plus le soleil qui entre par les
+# vitrages, calcule sur la serie meteo reelle.
+#
+# Deux consequences pedagogiques, visibles dans les resultats :
+#   - la temperature de non-chauffage n'est plus une hypothese, c'est un
+#     resultat : elle vaut T_interieure - apports / UA, donc une maison bien
+#     isolee arrete de chauffer beaucoup plus tot ;
+#   - une journee froide et ensoleillee coute moins cher qu'une journee douce
+#     et grise, ce qu'un modele en degres-jours ne sait pas montrer.
+# --------------------------------------------------------------------------
+
+#: 0,34 Wh par m3 d'air et par degre : masse volumique x capacite thermique
+#: de l'air, la constante usuelle des calculs de ventilation.
+C_AIR_WH_M3_K = 0.34
+
+#: Quantile de temperature retenu comme temperature exterieure de base pour
+#: le dimensionnement de la PAC (environ 9 heures par an en dessous).
+QUANTILE_T_BASE = 0.001
+
+_POA_CACHE: dict = {}
+
+
+def _poa_verticale(meteo: dict, azimut: float) -> np.ndarray:
+    """Rayonnement recu par un vitrage vertical oriente selon azimut (W/m2).
+
+    Le calcul est le meme que pour un panneau pose a 90 degres. Il est mis en
+    cache : l'interface le redemande a chaque frappe dans un champ.
+    """
+    from .solar import poa_irradiance
+    cle = (meteo.get("path"), int(meteo["n"]), round(float(azimut), 1))
+    poa = _POA_CACHE.get(cle)
+    if poa is None:
+        if len(_POA_CACHE) > 40:
+            _POA_CACHE.clear()
+        poa, _, _ = poa_irradiance(
+            meteo["Gbh"], meteo["Gdh"], meteo["sun_el"], meteo["sun_az"],
+            90.0, float(azimut), meteo["E0"])
+        _POA_CACHE[cle] = poa
+    return poa
+
+
+def deperditions(p: dict) -> dict:
+    """Geometrie et coefficient de deperdition UA (W/K) d'apres le descriptif.
+
+    Retourne le detail par paroi : c'est ce detail qui dit ou l'isolation
+    rapporterait le plus, et c'est lui que l'interface affiche.
+    """
+    s_hab = max(float(p.get("surface_habitable_m2", 0.0)), 0.0)
+    niveaux = max(int(round(float(p.get("n_niveaux", 1)))), 1)
+    h_plaf = max(float(p.get("hauteur_sous_plafond_m", 2.5)), 0.5)
+    allong = max(float(p.get("allongement", 1.5)), 1.0)
+
+    # Emprise au sol assimilee a un rectangle de meme surface et de meme
+    # allongement : c'est ce qui permet de deduire un perimetre, donc une
+    # surface de murs, de la seule surface habitable.
+    s_sol = s_hab / niveaux
+    largeur = (s_sol / allong) ** 0.5
+    perimetre = 2.0 * (largeur * allong + largeur)
+
+    mitoyen = min(max(float(p.get("part_murs_mitoyens", 0.0)), 0.0), 0.95)
+    s_murs_ext = perimetre * h_plaf * niveaux * (1.0 - mitoyen)
+    s_vitree = s_hab * max(float(p.get("part_vitree_pct", 0.0)), 0.0) / 100.0
+    s_vitree = min(s_vitree, s_murs_ext)          # pas plus de vitrage que de mur
+    s_murs = max(s_murs_ext - s_vitree, 0.0)
+
+    u_mur = C.u_valeur(C.U_MURS, p.get("iso_murs"), 0.70)
+    u_toit = C.u_valeur(C.U_TOITURE, p.get("iso_toiture"), 0.35)
+    u_plan = C.u_valeur(C.U_PLANCHER, p.get("iso_plancher"), 0.55)
+    u_vitr = C.u_valeur(C.U_VITRAGES, p.get("iso_vitrages"), 3.00)
+    b_plan = min(max(float(p.get("b_plancher", 0.8)), 0.0), 1.0)
+
+    ua_murs = s_murs * u_mur
+    ua_toiture = s_sol * u_toit
+    ua_plancher = s_sol * u_plan * b_plan
+    ua_vitrages = s_vitree * u_vitr
+    ua_parois = ua_murs + ua_toiture + ua_plancher + ua_vitrages
+    ua_ponts = ua_parois * max(float(p.get("ponts_thermiques_pct", 0.0)), 0.0) / 100.0
+
+    volume = s_hab * h_plaf
+    taux = max(float(p.get("renouv_air_vol_h", 0.0)), 0.0)
+    rend = min(max(float(p.get("rendement_echangeur", 0.0)), 0.0), 0.95)
+    ua_ventilation = C_AIR_WH_M3_K * taux * volume * (1.0 - rend)
+
+    correctif = max(float(p.get("correctif_deperditions", 1.0)), 0.0)
+    ua_total = (ua_parois + ua_ponts + ua_ventilation) * correctif
+
+    return {
+        "s_habitable": s_hab, "s_sol": s_sol, "s_murs": s_murs,
+        "s_vitree": s_vitree, "perimetre": perimetre, "volume": volume,
+        "u_murs": u_mur, "u_toiture": u_toit, "u_plancher": u_plan,
+        "u_vitrages": u_vitr,
+        "ua_murs": ua_murs * correctif, "ua_toiture": ua_toiture * correctif,
+        "ua_plancher": ua_plancher * correctif,
+        "ua_vitrages": ua_vitrages * correctif,
+        "ua_ponts": ua_ponts * correctif,
+        "ua_ventilation": ua_ventilation * correctif,
+        "ua_total": ua_total, "correctif": correctif,
+    }
+
+
+def apports_solaires_w(p: dict, meteo: dict, env: dict) -> np.ndarray:
+    """Puissance solaire (W) entrant par les vitrages, heure par heure."""
+    parts = C.ORIENTATIONS_VITRAGES.get(
+        p.get("orientation_vitrages"),
+        C.ORIENTATIONS_VITRAGES["Equilibre sud, est et ouest"])
+    poa = np.zeros(meteo["n"])
+    for azimut, part in parts.items():
+        if part > 0:
+            poa = poa + part * _poa_verticale(meteo, azimut)
+    transmission = (min(max(float(p.get("g_vitrage", 0.55)), 0.0), 1.0)
+                    * min(max(float(p.get("facteur_masques_solaires", 0.45)), 0.0), 1.0))
+    return env["s_vitree"] * transmission * poa
+
+
+def besoin_enveloppe(p: dict, meteo: dict, t_lissee=None):
+    """Besoin de chaleur horaire (kWh th) deduit du descriptif du logement.
+
+    Retourne (besoin_par_heure, info). info contient le detail des
+    deperditions, des apports, la temperature de non-chauffage equivalente et
+    la puissance de dimensionnement : tout ce que l'interface affiche.
+    """
+    env = deperditions(p)
+    inertie = p.get("inertie_h", 6)
+    t = moving_average(meteo["T2m"], inertie) if t_lissee is None else t_lissee
+    t_cons = float(p.get("t_consigne", T_CONSIGNE_REF))
+
+    pertes_w = env["ua_total"] * (t_cons - t)
+    internes_w = float(p.get("apports_internes_w_m2", 0.0)) * env["s_habitable"]
+    # Le soleil qui entre a 14 h chauffe encore a 18 h : les apports solaires
+    # suivent la meme inertie que la temperature exterieure.
+    solaires_w = moving_average(apports_solaires_w(p, meteo, env), inertie)
+
+    besoin_w = np.maximum(pertes_w - internes_w - solaires_w, 0.0)
+    th = besoin_w / 1000.0
+
+    ny = max(meteo["n_years"], 1e-9)
+    chauffe = besoin_w > 0
+    # Temperature de non-chauffage equivalente : celle a laquelle les apports
+    # gratuits compensent exactement les deperditions, pendant la saison de
+    # chauffe.
+    apports_moy = float((internes_w + solaires_w)[chauffe].mean()) if chauffe.any() \
+        else float(internes_w + solaires_w.mean())
+    t_base_eq = t_cons - apports_moy / max(env["ua_total"], 1e-9)
+
+    t_ext_base = float(np.quantile(meteo["T2m"], QUANTILE_T_BASE))
+    info = {
+        "ua_w_par_k": env["ua_total"],
+        "ua_murs": env["ua_murs"], "ua_toiture": env["ua_toiture"],
+        "ua_plancher": env["ua_plancher"], "ua_vitrages": env["ua_vitrages"],
+        "ua_ponts": env["ua_ponts"], "ua_ventilation": env["ua_ventilation"],
+        "s_murs": env["s_murs"], "s_sol": env["s_sol"],
+        "s_vitree": env["s_vitree"], "volume": env["volume"],
+        "s_habitable": env["s_habitable"],
+        "besoin_calcule_kwh_an": float(th.sum() / ny),
+        "besoin_par_m2": float(th.sum() / ny / max(env["s_habitable"], 1e-9)),
+        "apports_internes_kwh_an": float(internes_w * meteo["n"] / 1000.0 / ny),
+        "apports_solaires_kwh_an": float(solaires_w.sum() / 1000.0 / ny),
+        "apports_utilises_kwh_an": float(
+            np.minimum(internes_w + solaires_w, np.maximum(pertes_w, 0.0)).sum()
+            / 1000.0 / ny),
+        "t_base_equivalente": t_base_eq,
+        "t_ext_base": t_ext_base,
+        "p_dimensionnement_kw": env["ua_total"] * (t_cons - t_ext_base) / 1000.0,
+        "heures_de_chauffe": float(chauffe.sum() / ny),
+    }
+    return th, info
+
+
+def _besoin_saisi(p, meteo, t):
+    """Besoin horaire deduit d'un total annuel connu, reparti sur les
+    degres-heures reels de la serie meteo."""
     t_base = float(p["t_base"])
     besoin_ref = np.maximum(t_base - t, 0.0)
 
@@ -146,6 +325,16 @@ def _chauffage(p, meteo):
     facteur = float(besoin.sum()) / ref if ref > 0 else 1.0
 
     th = scale_to_annual(besoin, float(p["besoin_th_kwh_an"]) * facteur, meteo)
+    return th, {"facteur_consigne": facteur}
+
+
+def _chauffage(p, meteo):
+    t = moving_average(meteo["T2m"], p.get("inertie_h", 6))
+
+    if str(p.get("mode_besoin", C.MODE_BESOIN_SAISI)) == C.MODE_BESOIN_ENVELOPPE:
+        th, info = besoin_enveloppe(p, meteo, t)
+    else:
+        th, info = _besoin_saisi(p, meteo, t)
 
     # Appoint bois quand il fait froid
     part_bois = float(p.get("part_bois", 0.0))
@@ -166,7 +355,7 @@ def _chauffage(p, meteo):
     elec = th_pac / cop + th_appoint  # appoint = effet Joule, COP 1
 
     ny = meteo["n_years"]
-    info = {
+    info.update({
         "th_total_kwh_an": float(th.sum() / ny),
         "th_bois_kwh_an": float(th_bois.sum() / ny),
         "th_pac_kwh_an": float(th_pac.sum() / ny),
@@ -174,8 +363,7 @@ def _chauffage(p, meteo):
         "scop_realise": float(th_pac.sum() / max((th_pac / cop).sum(), 1e-9)),
         "heures_saturation_pac": float((th_appoint > 1e-6).sum() / ny),
         "p_max_appelee_th_kw": float(th.max()),
-        "facteur_consigne": facteur,
-    }
+    })
     return elec, info
 
 
