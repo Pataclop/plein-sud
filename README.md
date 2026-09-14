@@ -30,7 +30,8 @@ Dernière version dans **[Releases](https://github.com/Pataclop/plein-sud/releas
 | Système | Fichier |
 |---|---|
 | **Windows** | `PleinSud-windows.exe` — double-cliquez, rien à installer |
-| **macOS** | `PleinSud-macos.zip` — dézippez, glissez l'app dans *Applications* |
+| **macOS Apple Silicon** | `PleinSud-macos-arm64.zip` — dézippez, glissez l'app dans *Applications* |
+| **macOS Intel** | `PleinSud-macos-intel.zip` — idem |
 
 > Les exécutables ne sont pas signés. Sous macOS, faites un clic droit →
 > *Ouvrir* au premier lancement ; sous Windows, *Informations complémentaires* →

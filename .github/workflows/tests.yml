@@ -20,5 +20,5 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-      - run: pip install numpy pytest
+      - run: pip install numpy pytest tzdata
       - run: pytest -q
