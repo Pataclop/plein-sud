@@ -12,9 +12,6 @@ jobs:
   build:
     name: ${{ matrix.nom }}
     runs-on: ${{ matrix.os }}
-    # Les runners macOS Intel se font rares : s'ils manquent, la release sort
-    # quand meme avec les autres executables plutot que de rester bloquee.
-    continue-on-error: ${{ matrix.optionnel == true }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -23,13 +20,11 @@ jobs:
           - os: windows-latest
             nom: Windows
             artefact: PleinSud-windows.exe
+          # Pas de build macOS Intel : les runners macos-13 ne sont plus
+          # alloues et un job en file d'attente bloquerait la publication.
           - os: macos-latest
             nom: macOS Apple Silicon
             artefact: PleinSud-macos-arm64.zip
-          - os: macos-13
-            nom: macOS Intel
-            artefact: PleinSud-macos-intel.zip
-            optionnel: true
     steps:
       - uses: actions/checkout@v4
 
